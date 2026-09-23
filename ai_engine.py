@@ -198,46 +198,52 @@ def get_active_flash_models(client: Optional[genai.Client] = None) -> List[str]:
 
 def optimize_image(image_bytes: bytes) -> Optional[bytes]:
     """
-    Optimizes an image's size, format, and resolution for safe API transport and server uploads.
-    - Downscales to fit within 2000x2000 while preserving aspect ratio.
-    - Strips 100% of EXIF, XMP, IPTC, and ICC profiles by pasting into a brand new clean Image.
-    - Saves as JPEG at 85% quality.
-    - Returns None if invalid or corrupted.
+    Optimizes high-resolution smartphone photos under strict 256MB RAM constraints.
+    Uses JPEG draft decoding to downsample during stream reading, avoiding
+    full-resolution bitmap allocation in memory.
     """
-    try:
-        # Enforce Megapixel ceiling and catch decompression bomb
-        Image.MAX_IMAGE_PIXELS = 67108864  # 64 Megapixels
-        img = Image.open(io.BytesIO(image_bytes))
-        img.load()
-    except Image.DecompressionBombError as dbe:
-        import gc
-        gc.collect()
-        print(f"[AI ERROR] Decompression bomb detected in optimize_image: {dbe}", flush=True)
-        raise dbe
-    except Exception as e:
-        import gc
-        gc.collect()
-        print(f"[AI ERROR] Failed to identify or load image: {e}", flush=True)
-        return None
+    import io
+    import gc
+    from PIL import Image
+
+    # Enforce safe upper ceiling for pixel bomb defense (64 Megapixels)
+    Image.MAX_IMAGE_PIXELS = 67108864
 
     try:
-        # Downscale maximum maintaining aspect ratio to max 2000x2000
-        img.thumbnail((2000, 2000), Image.Resampling.LANCZOS)
-        
-        # Create a brand new clean 8-bit RGB image to discard all EXIF, XMP, IPTC, and ICC profiles
-        clean_img = Image.new("RGB", img.size, (255, 255, 255))
-        clean_img.paste(img)
-        
-        # Compress and save as JPEG
-        out_buf = io.BytesIO()
-        clean_img.save(out_buf, format="JPEG", quality=85)
-        return out_buf.getvalue()
-    except Exception as e:
-        import gc
+        in_stream = io.BytesIO(image_bytes)
+        with Image.open(in_stream) as img:
+            # 1. JPEG Streaming Draft Downscale: Decodes directly at 1/2 or 1/4 resolution
+            if img.format == "JPEG" and (img.width > 1600 or img.height > 1600):
+                img.draft("RGB", (1600, 1600))
+
+            # 2. Downscale immediately BEFORE any color conversions or canvas allocations
+            img.thumbnail((1600, 1600), Image.Resampling.BILINEAR)
+
+            # 3. Direct RGB conversion on the already-downscaled lightweight image (< 6MB RAM)
+            if img.mode != "RGB":
+                clean_img = img.convert("RGB")
+            else:
+                clean_img = img
+
+            # 4. Save to compressed JPEG memory buffer
+            out_buf = io.BytesIO()
+            clean_img.save(out_buf, format="JPEG", quality=75, optimize=True)
+            optimized_payload = out_buf.getvalue()
+
+            out_buf.close()
+
+        in_stream.close()
+
+        # Explicit garbage collection to purge transient decompression arrays immediately
         gc.collect()
-        print(f"[AI ERROR] Error optimizing image: {e}", flush=True)
-        traceback.print_exc(file=sys.stdout)
-        sys.stdout.flush()
+
+        return optimized_payload
+
+    except Image.DecompressionBombError:
+        raise
+    except Exception as e:
+        print(f"[IMAGE OPTIMIZE ERROR] Failed to optimize image: {e}", flush=True)
+        gc.collect()
         return None
 
 def verify_document(image_bytes: bytes) -> dict:
