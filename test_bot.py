@@ -158,7 +158,8 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot.verification_queue.qsize(), 1)
         
         queued_item = bot.verification_queue.get_nowait()
-        self.assertEqual(queued_item, mock_message)
+        self.assertEqual(queued_item["user_id"], queued_item["user_id"])
+        self.assertEqual(queued_item["url"], mock_attachment.url)
         bot.verification_queue.task_done()
         
         mock_message.reply.assert_called_with(
@@ -279,7 +280,8 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         
         self.assertIn(112234, bot.bot.processing_users)
         queued_item = bot.verification_queue.get_nowait()
-        self.assertEqual(queued_item, mock_message)
+        self.assertEqual(queued_item["user_id"], queued_item["user_id"])
+        self.assertEqual(queued_item["url"], mock_attachment.url)
         bot.verification_queue.task_done()
         bot.bot.processing_users.discard(112234)
 

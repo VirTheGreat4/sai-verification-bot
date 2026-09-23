@@ -6,6 +6,7 @@ import re
 import sys
 import traceback
 import concurrent.futures
+import asyncio
 import pydantic
 from PIL import Image
 
@@ -18,8 +19,8 @@ from typing import List, Optional, Tuple, Any, Dict
 
 # Target models for verification failover hierarchy
 TARGET_MODELS = [
-    "gemini-3.5-flash",
-    "gemini-3.5-flash-lite"
+    "gemini-3.5-flash-lite",
+    "gemini-2.5-flash"
 ]
 
 # Pydantic models for strictly enforcing target schema
@@ -401,11 +402,14 @@ def verify_document(image_bytes: bytes) -> dict:
 
             while demand_retry_count < max_demand_retries:
                 try:
-                    response = client.models.generate_content(
-                        model=model_name,
-                        contents=contents,
-                        config=config
-                    )
+                    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+                        future = executor.submit(
+                            client.models.generate_content,
+                            model=model_name,
+                            contents=contents,
+                            config=config
+                        )
+                        response = future.result(timeout=12.0)
 
                     raw_text = getattr(response, "text", "") or ""
                     cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.MULTILINE)
@@ -468,16 +472,17 @@ def verify_document(image_bytes: bytes) -> dict:
                         time.sleep(2)
                         continue
 
+                except (concurrent.futures.TimeoutError, TimeoutError, asyncio.TimeoutError):
+                    print(f"[AI TIMEOUT] Model {model_name} timed out after 12.0s. Immediately switching to next model...", flush=True)
+                    break
+
                 except Exception as e:
                     err_str = str(e).lower()
 
-                    # RULE 1: HIGH DEMAND / SERVER OVERLOAD -> RETRY ON SAME KEY & SAME MODEL
+                    # RULE 1: HIGH DEMAND / SERVER OVERLOAD / 503 -> IMMEDIATELY SWITCH TO NEXT MODEL WITHOUT SLEEPING ON SAME DEAD KEY
                     if any(term in err_str for term in ["503", "504", "unavailable", "timeout", "overloaded"]):
-                        demand_retry_count += 1
-                        print(f"[AI HIGH DEMAND] {model_name} is under heavy server traffic. Retrying ({demand_retry_count}/{max_demand_retries}) on the SAME key in 3s...", flush=True)
-                        time.sleep(3)
-                        gc.collect()
-                        continue
+                        print(f"[AI HIGH DEMAND / 503] Model {model_name} hit traffic/503. Immediately switching to next model...", flush=True)
+                        break
 
                     # RULE 2: QUOTA LIMIT REACHED -> ONLY HERE DOES THE KEY ROTATE
                     elif any(term in err_str for term in ["429", "resource_exhausted", "quota"]):
@@ -501,3 +506,5 @@ def verify_document(image_bytes: bytes) -> dict:
         print(f"[AI MODEL EXHAUSTED] All {total_keys} keys hit quota on {model_name}. Advancing to next model in hierarchy...", flush=True)
 
     raise RuntimeError("Verification pipeline exhausted all models and API keys.")
+
+audit_sai_document = verify_document

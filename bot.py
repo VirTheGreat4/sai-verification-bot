@@ -9,6 +9,8 @@ import asyncio
 import time
 import discord
 import hashlib
+import aiohttp
+import gc
 from PIL import Image
 
 # Enforce an absolute 64 Megapixel ceiling to prevent decompression bombs (DoS)
@@ -28,6 +30,9 @@ load_dotenv("reference_images/.env")
 
 # Production Constants - Hardened: Max size is 8MB (8388608 bytes)
 MAX_FILE_SIZE = 26214400  # 25MB (25 * 1024 * 1024 bytes)
+
+MAX_QUEUE_DEPTH = 3
+queue_semaphore = asyncio.Semaphore(1)
 
 # Module level queue for backward compatibility with existing tests
 verification_queue = asyncio.Queue()
@@ -111,218 +116,281 @@ class VerificationBot(commands.Bot):
         Ensures all synchronous blocking calls are run via asyncio.to_thread().
         """
         while True:
-            message = await self.verification_queue.get()
-            user_id = message.author.id
+            item = await self.verification_queue.get()
+            user_id = item["user_id"]
+            url = item["url"]
+            channel_id = item["channel_id"]
             user_id_str = str(user_id)
             print(f"[WORKER] Picked up verification job for user {user_id}. Starting analysis...", flush=True)
-            try:
-                # We already validated the attachment in on_message, so we know message.attachments[0] exists
-                attachment = message.attachments[0]
-                
-                # Status message to indicate analysis has begun
-                status_msg = await message.reply("⏳ Analyzing your SAI document... Please note: Verification may take a few moments while we audit your document. Thank you for your patience!")
-                
-                # Read attachment bytes (run async)
+
+            channel = self.get_channel(channel_id)
+            if not channel:
                 try:
-                    raw_bytes = await attachment.read()
-                except Exception as e:
-                    print(f"Error reading attachment: {e}")
-                    await status_msg.edit(content="❌ Error: Failed to read file.")
-                    continue
+                    channel = await self.fetch_channel(channel_id)
+                except Exception:
+                    channel = None
 
-                # Magic Bytes File Signature Verification: Do NOT trust Discord's attachment.content_type
-                if not verify_magic_bytes(raw_bytes):
-                    await status_msg.edit(content="❌ Invalid file. The uploaded image does not have a valid file signature (JPEG, PNG, or WebP).")
-                    continue
-
-                # Optimize image and catch PIL Decompression Bomb Protection
+            async with queue_semaphore:
+                image_bytes = None
+                status_msg = None
+                optimized_bytes = None
                 try:
-                    optimized_bytes = await asyncio.to_thread(ai_engine.optimize_image, raw_bytes)
-                except Image.DecompressionBombError as dbe:
-                    print(f"Decompression bomb detected: {dbe}")
-                    await status_msg.edit(content="❌ Image processing aborted: Decompression bomb detected (exceeded 8 Megapixel ceiling).")
-                    continue
-                except Exception as e:
-                    print(f"Error reading attachment: {e}")
-                    optimized_bytes = None
+                    if channel:
+                        status_msg = await channel.send("⏳ Analyzing your SAI document... Please note: Verification may take a few moments while we audit your document. Thank you for your patience!")
+                    
+                    # Download raw image bytes from url using async aiohttp.ClientSession directly into memory
+                    async with aiohttp.ClientSession() as session:
+                        async with session.get(url) as resp:
+                            if resp.status == 200:
+                                image_bytes = await resp.read()
+                            else:
+                                raise RuntimeError(f"Failed to download image from URL, status {resp.status}")
 
-                if optimized_bytes is None:
-                    await status_msg.edit(content="❌ Invalid file. The uploaded image is corrupted or invalid.")
-                    continue
-
-                # Atomic TOCTOU Prevention: lock per user
-                user_lock = await get_lock(user_id)
-                async with user_lock:
-                    # Offload synchronous AI engine call to thread pool via asyncio.to_thread
-                    result = await asyncio.to_thread(ai_engine.verify_document, optimized_bytes)
-
-                    verified = result.get("verified", False)
-                    reason = result.get("reason", "Verification unsuccessful.")
-                    extracted_id = result.get("extracted_id", "").strip()
-
-                    if reason == "DECOMPRESSION_BOMB":
-                        await status_msg.edit(content="❌ Image processing aborted: Decompression bomb detected (exceeded 8 Megapixel ceiling).")
+                    # Magic Bytes File Signature Verification: Do NOT trust Discord's attachment.content_type
+                    if not verify_magic_bytes(image_bytes):
+                        if status_msg:
+                            await status_msg.edit(content="❌ Invalid file. The uploaded image does not have a valid file signature (JPEG, PNG, or WebP).")
                         continue
 
-                    # PASS Logic
-                    if verified:
-                        student_hash = await asyncio.to_thread(database.hash_student_id, extracted_id)
-                        # Atomic TOCTOU Prevention: lock per student hash
-                        hash_lock = await get_lock(student_hash)
-                        async with hash_lock:
-                            is_used = await asyncio.to_thread(database.is_student_id_used, extracted_id)
-                            if is_used:
-                                # Treat as duplicate -> Fail
-                                verified = False
-                                reason = f"Duplicate verification: Student ID '{extracted_id}' is already registered to another user."
+                    # Optimize image and catch PIL Decompression Bomb Protection
+                    try:
+                        optimized_bytes = await asyncio.to_thread(ai_engine.optimize_image, image_bytes)
+                    except Image.DecompressionBombError as dbe:
+                        print(f"Decompression bomb detected: {dbe}")
+                        if status_msg:
+                            await status_msg.edit(content="❌ Image processing aborted: Decompression bomb detected (exceeded 8 Megapixel ceiling).")
+                        continue
+                    except Exception as e:
+                        print(f"Error reading attachment: {e}")
+                        optimized_bytes = None
 
-                                # Send audit alert to MOD_LOG_CHANNEL_ID
-                                existing_record = await asyncio.to_thread(database.get_student_by_id, extracted_id)
-                                original_discord_id = existing_record["discord_id"] if existing_record else "Unknown"
-                                mod_log_id = int(os.environ.get("MOD_LOG_CHANNEL_ID", 0))
-                                if mod_log_id and message.guild:
-                                    try:
-                                        mod_channel = message.guild.get_channel(mod_log_id)
-                                        if not mod_channel:
-                                            mod_channel = await message.guild.fetch_channel(mod_log_id)
-                                        if mod_channel:
-                                            mod_embed = discord.Embed(
-                                                title="⚠️ Duplicate Student ID Detected",
-                                                description="A student submitted a Student ID that is already registered in the system.",
-                                                color=discord.Color.gold()
-                                            )
-                                            mod_embed.add_field(name="Applicant", value=f"<@{user_id}>", inline=True)
-                                            mod_embed.add_field(name="Existing Registered User", value=f"<@{original_discord_id}>", inline=True)
-                                            mod_embed.add_field(
-                                                name="Action Needed",
-                                                value="Staff review required via `/check-student` or `/unlink-student`.",
-                                                inline=False
-                                            )
-                                            msg = await mod_channel.send(embed=mod_embed)
-                                            self.sent_audit_logs[msg.id] = mod_embed
-                                    except Exception as e:
-                                        print(f"Failed to send mod log embed: {e}")
-                            else:
-                                await asyncio.to_thread(database.add_verified_user, user_id_str, extracted_id)
-                                
-                                guild_id = int(os.environ.get("GUILD_ID", 0))
-                                guild = message.guild or self.get_guild(guild_id)
-                                role_assigned = False
-                                if guild:
-                                    role = guild.get_role(int(os.environ.get("VERIFIED_ROLE_ID", 0)))
-                                    # DM Member Fetch Safety: safely fetch member
-                                    member = await fetch_member_safely(guild, user_id)
-                                    if member and role:
+                    if optimized_bytes is None:
+                        if status_msg:
+                            await status_msg.edit(content="❌ Invalid file. The uploaded image is corrupted or invalid.")
+                        continue
+
+                    # Atomic TOCTOU Prevention: lock per user
+                    user_lock = await get_lock(user_id)
+                    async with user_lock:
+                        # Offload synchronous AI engine call to thread pool via asyncio.to_thread
+                        result = await asyncio.to_thread(ai_engine.audit_sai_document, optimized_bytes)
+
+                        verified = result.get("verified", False)
+                        reason = result.get("reason", "Verification unsuccessful.")
+                        extracted_id = result.get("extracted_id", "").strip()
+
+                        if reason == "DECOMPRESSION_BOMB":
+                            if status_msg:
+                                await status_msg.edit(content="❌ Image processing aborted: Decompression bomb detected (exceeded 8 Megapixel ceiling).")
+                            continue
+
+                        # PASS Logic
+                        if verified:
+                            student_hash = await asyncio.to_thread(database.hash_student_id, extracted_id)
+                            # Atomic TOCTOU Prevention: lock per student hash
+                            hash_lock = await get_lock(student_hash)
+                            async with hash_lock:
+                                is_used = await asyncio.to_thread(database.is_student_id_used, extracted_id)
+                                if is_used:
+                                    # Treat as duplicate -> Fail
+                                    verified = False
+                                    reason = f"Duplicate verification: Student ID '{extracted_id}' is already registered to another user."
+
+                                    # Send audit alert to MOD_LOG_CHANNEL_ID
+                                    existing_record = await asyncio.to_thread(database.get_student_by_id, extracted_id)
+                                    original_discord_id = existing_record["discord_id"] if existing_record else "Unknown"
+                                    mod_log_id = int(os.environ.get("MOD_LOG_CHANNEL_ID", 0))
+                                    guild = channel.guild if channel and hasattr(channel, "guild") else self.get_guild(int(os.environ.get("GUILD_ID", 0)))
+                                    if mod_log_id and guild:
                                         try:
-                                            await member.add_roles(role)
-                                            role_assigned = True
+                                            mod_channel = guild.get_channel(mod_log_id)
+                                            if not mod_channel:
+                                                mod_channel = await guild.fetch_channel(mod_log_id)
+                                            if mod_channel:
+                                                mod_embed = discord.Embed(
+                                                    title="⚠️ Duplicate Student ID Detected",
+                                                    description="A student submitted a Student ID that is already registered in the system.",
+                                                    color=discord.Color.gold()
+                                                )
+                                                mod_embed.add_field(name="Applicant", value=f"<@{user_id}>", inline=True)
+                                                mod_embed.add_field(name="Existing Registered User", value=f"<@{original_discord_id}>", inline=True)
+                                                mod_embed.add_field(
+                                                    name="Action Needed",
+                                                    value="Staff review required via `/check-student` or `/unlink-student`.",
+                                                    inline=False
+                                                )
+                                                msg = await mod_channel.send(embed=mod_embed)
+                                                self.sent_audit_logs[msg.id] = mod_embed
                                         except Exception as e:
-                                            print(f"Failed to assign role to {user_id_str} on success: {e}")
-
-                                success_embed = discord.Embed(
-                                    title="Verification Successful",
-                                    description="🎉 Your student student verification has been approved automatically!",
-                                    color=discord.Color.green()
-                                )
-                                success_embed.add_field(name="Student ID", value=extracted_id, inline=True)
-                                if role_assigned:
-                                    success_embed.add_field(name="Role Assigned", value="Verified Student", inline=True)
+                                            print(f"Failed to send mod log embed: {e}")
                                 else:
-                                    success_embed.add_field(name="Role Status", value="Role pending assignment.", inline=True)
+                                    await asyncio.to_thread(database.add_verified_user, user_id_str, extracted_id)
                                     
-                                await status_msg.edit(content="✅ Analysis complete!")
-                                await message.reply(embed=success_embed)
-                                continue
+                                    guild_id = int(os.environ.get("GUILD_ID", 0))
+                                    guild = (channel.guild if channel and hasattr(channel, "guild") else None) or self.get_guild(guild_id)
+                                    role_assigned = False
+                                    if guild:
+                                        role = guild.get_role(int(os.environ.get("VERIFIED_ROLE_ID", 0)))
+                                        # DM Member Fetch Safety: safely fetch member
+                                        member = await fetch_member_safely(guild, user_id)
+                                        if member and role:
+                                            try:
+                                                await member.add_roles(role)
+                                                role_assigned = True
+                                            except Exception as e:
+                                                print(f"Failed to assign role to {user_id_str} on success: {e}")
 
-                    # FAIL Logic (Warning or Lock)
-                    await asyncio.to_thread(database.add_strike, user_id_str)
-                    updated_state = await asyncio.to_thread(database.get_user_state, user_id_str)
-                    strikes = 1
-                    is_locked = False
-                    if updated_state:
-                        strikes, is_locked = updated_state
+                                    success_embed = discord.Embed(
+                                        title="Verification Successful",
+                                        description="🎉 Your student verification has been approved automatically!",
+                                        color=discord.Color.green()
+                                    )
+                                    success_embed.add_field(name="Student ID", value=extracted_id, inline=True)
+                                    if role_assigned:
+                                        success_embed.add_field(name="Role Assigned", value="Verified Student", inline=True)
+                                    else:
+                                        success_embed.add_field(name="Role Status", value="Role pending assignment.", inline=True)
+                                        
+                                    if status_msg:
+                                        await status_msg.edit(content="✅ Analysis complete!")
+                                    if channel:
+                                        await channel.send(embed=success_embed)
+                                    continue
 
-                    if is_locked or strikes >= 2:
-                        # Strike 2 (Lock user & forward to staff)
-                        await status_msg.edit(content="❌ Verification failed.")
-                        
-                        lock_embed = discord.Embed(
-                            title="Verification Locked",
-                            description=(
-                                "❌ You have accumulated 2 strikes. Your verification has been locked "
-                                "and forwarded to server staff for manual review. Please wait for assistance."
-                            ),
-                            color=discord.Color.red()
-                        )
-                        lock_embed.add_field(name="Failure Reason", value=reason, inline=False)
-                        await message.reply(embed=lock_embed)
-                        
-                        # Send to staff pending channel
+                        # FAIL Logic (Warning or Lock)
+                        await asyncio.to_thread(database.add_strike, user_id_str)
+                        updated_state = await asyncio.to_thread(database.get_user_state, user_id_str)
+                        strikes = 1
+                        is_locked = False
+                        if updated_state:
+                            strikes, is_locked = updated_state
+
+                        if is_locked or strikes >= 2:
+                            # Strike 2 (Lock user & forward to staff)
+                            if status_msg:
+                                await status_msg.edit(content="❌ Verification failed.")
+                            
+                            lock_embed = discord.Embed(
+                                title="Verification Locked",
+                                description=(
+                                    "❌ You have accumulated 2 strikes. Your verification has been locked "
+                                    "and forwarded to server staff for manual review. Please wait for assistance."
+                                ),
+                                color=discord.Color.red()
+                            )
+                            lock_embed.add_field(name="Failure Reason", value=reason, inline=False)
+                            if channel:
+                                await channel.send(embed=lock_embed)
+                            
+                            # Send to staff pending channel
+                            pending_channel_id = int(os.environ.get("PENDING_CHANNEL_ID", 0))
+                            guild_id = int(os.environ.get("GUILD_ID", 0))
+                            guild = (channel.guild if channel and hasattr(channel, "guild") else None) or self.get_guild(guild_id)
+                            pending_channel = None
+                            if guild:
+                                pending_channel = guild.get_channel(pending_channel_id)
+                                if not pending_channel:
+                                    try:
+                                        pending_channel = await guild.fetch_channel(pending_channel_id)
+                                    except Exception:
+                                        pass
+                            if not pending_channel:
+                                pending_channel = self.get_channel(pending_channel_id)
+
+                            if pending_channel:
+                                view = StaffButtonsView()
+                                staff_embed = discord.Embed(
+                                    title="Manual Verification Required",
+                                    description="User has accumulated 2 strikes and is locked. Please review the attached document.",
+                                    color=discord.Color.orange()
+                                )
+                                staff_embed.add_field(name="User Mention", value=f"<@{user_id}>", inline=True)
+                                staff_embed.add_field(name="User ID", value=user_id_str, inline=True)
+                                staff_embed.add_field(name="Student ID", value=extracted_id if extracted_id else "N/A", inline=True)
+                                staff_embed.add_field(name="Failure Reason", value=reason, inline=False)
+
+                                # Re-upload the optimized image buffer directly (always < 10MB, no URLs)
+                                try:
+                                    file_to_forward = discord.File(
+                                        io.BytesIO(optimized_bytes if optimized_bytes else image_bytes), filename="sai_document.jpg"
+                                    )
+                                    await pending_channel.send(embed=staff_embed, file=file_to_forward, view=view)
+                                except Exception as e:
+                                    print(f"Failed to forward verification image to staff: {e}")
+                                    await pending_channel.send(embed=staff_embed, view=view)
+                        else:
+                            # Strike 1: Warning
+                            if status_msg:
+                                await status_msg.edit(content="❌ Verification failed.")
+                            
+                            warn_embed = discord.Embed(
+                                title="Verification Warning (Strike 1/2)",
+                                description=(
+                                    "⚠️ Your document verification failed. You have received 1 strike. "
+                                    "You have one remaining attempt before your account is locked and sent to manual review."
+                                ),
+                                color=discord.Color.yellow()
+                            )
+                            warn_embed.add_field(name="Failure Reason", value=reason, inline=False)
+                            if channel:
+                                await channel.send(embed=warn_embed)
+
+                except Exception as e:
+                    # Log error and notify user via channel / staff
+                    print(f"Error in verification worker processing: {e}", flush=True)
+                    traceback.print_exc(file=sys.stdout)
+                    sys.stdout.flush()
+                    
+                    # Lock user on AI error / timeout and forward to staff
+                    try:
+                        await asyncio.to_thread(database.add_strike, user_id_str)
+                        await asyncio.to_thread(database.add_strike, user_id_str)
+                    except Exception:
+                        pass
+
+                    if status_msg:
+                        try:
+                            await status_msg.edit(content="❌ An error occurred while analyzing your document. Forwarded to staff for manual review.")
+                        except Exception:
+                            pass
+
+                    try:
                         pending_channel_id = int(os.environ.get("PENDING_CHANNEL_ID", 0))
                         guild_id = int(os.environ.get("GUILD_ID", 0))
-                        guild = message.guild or self.get_guild(guild_id)
+                        guild = (channel.guild if channel and hasattr(channel, "guild") else None) or self.get_guild(guild_id)
                         pending_channel = None
                         if guild:
                             pending_channel = guild.get_channel(pending_channel_id)
                             if not pending_channel:
-                                try:
-                                    pending_channel = await guild.fetch_channel(pending_channel_id)
-                                except Exception:
-                                    pass
+                                pending_channel = await guild.fetch_channel(pending_channel_id)
                         if not pending_channel:
                             pending_channel = self.get_channel(pending_channel_id)
 
-                        if pending_channel:
+                        if pending_channel and image_bytes:
                             view = StaffButtonsView()
                             staff_embed = discord.Embed(
-                                title="Manual Verification Required",
-                                description="User has accumulated 2 strikes and is locked. Please review the attached document.",
+                                title="Manual Verification Required (AI Error / Timeout)",
+                                description="The AI verification pipeline encountered an error or timeout. User has been locked. Please review the attached document.",
                                 color=discord.Color.orange()
                             )
-                            staff_embed.add_field(name="User Mention", value=message.author.mention, inline=True)
+                            staff_embed.add_field(name="User Mention", value=f"<@{user_id}>", inline=True)
                             staff_embed.add_field(name="User ID", value=user_id_str, inline=True)
-                            staff_embed.add_field(name="Student ID", value=extracted_id if extracted_id else "N/A", inline=True)
-                            staff_embed.add_field(name="Failure Reason", value=reason, inline=False)
+                            staff_embed.add_field(name="Student ID", value="N/A", inline=True)
+                            staff_embed.add_field(name="Failure Reason", value=str(e), inline=False)
 
-                            # Re-upload the optimized image buffer directly (always < 10MB, no URLs)
-                            try:
-                                file_to_forward = await asyncio.to_thread(
-                                    lambda: discord.File(io.BytesIO(optimized_bytes), filename="sai_document.jpg")
-                                )
-                                await pending_channel.send(embed=staff_embed, file=file_to_forward, view=view)
-                            except Exception as e:
-                                print(f"Failed to forward verification image to staff: {e}")
-                                await pending_channel.send(embed=staff_embed, view=view)
-                    else:
-                        # Strike 1: Warning
-                        await status_msg.edit(content="❌ Verification failed.")
-                        
-                        warn_embed = discord.Embed(
-                            title="Verification Warning (Strike 1/2)",
-                            description=(
-                                "⚠️ Your document verification failed. You have received 1 strike. "
-                                "You have one remaining attempt before your account is locked and sent to manual review."
-                            ),
-                            color=discord.Color.yellow()
-                        )
-                        warn_embed.add_field(name="Failure Reason", value=reason, inline=False)
-                        await message.reply(embed=warn_embed)
+                            file_to_forward = discord.File(io.BytesIO(optimized_bytes if optimized_bytes else image_bytes), filename="sai_document.jpg")
+                            await pending_channel.send(embed=staff_embed, file=file_to_forward, view=view)
+                    except Exception as fwd_err:
+                        print(f"Failed to forward error image to staff: {fwd_err}")
 
-            except Exception as e:
-                # Log error and notify user via DM
-                print(f"Error in verification worker processing: {e}", flush=True)
-                traceback.print_exc(file=sys.stdout)
-                sys.stdout.flush()
-                try:
-                    await message.author.send("❌ An error occurred while analyzing your document. Please try again in a few moments.")
-                except Exception:
-                    try:
-                        await message.reply("❌ An error occurred while analyzing your document. Please try again in a few moments.")
-                    except Exception:
-                        pass
-            finally:
-                self.verification_queue.task_done()
-                self.processing_users.discard(user_id)
+                finally:
+                    if image_bytes is not None:
+                        del image_bytes
+                    if optimized_bytes is not None:
+                        del optimized_bytes
+                    gc.collect()
+                    self.verification_queue.task_done()
+                    self.processing_users.discard(user_id)
 
 
 # ==================== HELPER FUNCTIONS ====================
@@ -946,9 +1014,19 @@ async def on_message(message: discord.Message) -> None:
                 pass
         return
 
-    # Add to processing_users and queue
+    # Check queue depth backpressure
+    if verification_queue.qsize() >= MAX_QUEUE_DEPTH:
+        await message.reply("⚠️ Verification traffic is currently high. Please retry in 1-2 minutes.")
+        return
+
+    # Add to processing_users and queue ONLY metadata dict
     bot.processing_users.add(user_id)
-    await verification_queue.put(message)
+    meta = {
+        "url": attachment.url,
+        "user_id": user_id,
+        "channel_id": message.channel.id
+    }
+    await verification_queue.put(meta)
     await message.reply(f"⏳ Added to the verification queue! You are currently position: {verification_queue.qsize()}.")
 
 
