@@ -126,6 +126,18 @@ class TestDatabase(unittest.TestCase):
         state = database.get_user_state("123456")
         self.assertEqual(state, (0, False))
 
+    def test_reset_all_locks(self) -> None:
+        database.add_strike("user1")
+        database.add_strike("user1")
+        database.add_strike("user2")
+        database.add_strike("user2")
+        self.assertEqual(database.get_user_state("user1"), (2, True))
+        self.assertEqual(database.get_user_state("user2"), (2, True))
+
+        database.reset_all_locks()
+        self.assertEqual(database.get_user_state("user1"), (0, False))
+        self.assertEqual(database.get_user_state("user2"), (0, False))
+
     def test_get_user_state_nonexistent(self) -> None:
         state = database.get_user_state("nonexistent")
         self.assertIsNone(state)

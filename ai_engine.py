@@ -16,6 +16,12 @@ from google import genai
 from google.genai import types, errors
 from typing import List, Optional, Tuple, Any, Dict
 
+# Target models for verification failover hierarchy
+TARGET_MODELS = [
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite"
+]
+
 # Pydantic models for strictly enforcing target schema
 class ExtractedData(pydantic.BaseModel):
     student_name: Optional[str] = None
@@ -81,66 +87,80 @@ def load_env_keys(file_path: str = ".env") -> List[str]:
 
 # Initialize API Keys pool
 api_keys = load_env_keys()
+key_pool_list = api_keys
 key_pool = itertools.cycle(api_keys) if api_keys else None
+_current_key_val = None
 
 def rotate_api_key() -> Optional[str]:
     """
     Switches to the next API key in the cycle pool and returns it.
     Returns the selected API key, or None if no keys are available.
     """
+    global _current_key_val
     if not key_pool:
         single_key = os.environ.get("GEMINI_API_KEY")
         if single_key:
+            _current_key_val = single_key
             return single_key
+        _current_key_val = None
         return None
     next_key = next(key_pool)
+    _current_key_val = next_key
     return next_key
+
+def get_current_api_key() -> Optional[str]:
+    """
+    Returns the currently active API key without rotating,
+    or selects the first key if none has been selected yet.
+    """
+    global _current_key_val
+    if _current_key_val is None:
+        return rotate_api_key()
+    return _current_key_val
 
 def load_reference_images(folder_path: str = "reference_images") -> List[Image.Image]:
     """
-    Scans the directory for valid images (.jpg, .jpeg, .png, .webp),
-    converts them to PIL Image objects, and returns them in a list.
-    Returns an empty list if the folder is missing or empty.
+    Loads ONLY the primary template 'ref_img_01.jpg' from the directory
+    into memory to prevent 256MB RAM OOM crash (Exit Code 137).
     """
     if not os.path.exists(folder_path) or not os.path.isdir(folder_path):
         return []
         
-    valid_exts = {".jpg", ".jpeg", ".png", ".webp"}
     images = []
-    try:
-        for filename in sorted(os.listdir(folder_path)):
-            ext = os.path.splitext(filename)[1].lower()
-            if ext in valid_exts:
-                img_path = os.path.join(folder_path, filename)
-                try:
-                    # Enforce Megapixel ceiling before opening
-                    Image.MAX_IMAGE_PIXELS = 67108864
-                    with open(img_path, "rb") as f:
-                        raw_bytes = f.read()
-                    opt_bytes = optimize_image(raw_bytes)
-                    if opt_bytes:
-                        img = Image.open(io.BytesIO(opt_bytes))
-                        img.load()
-                        images.append(img)
-                    else:
-                        img = Image.open(img_path)
-                        img.load()
-                        images.append(img)
-                except Exception as e:
-                    print(f"[AI ERROR] Error loading reference image {img_path}: {e}", flush=True)
-                    traceback.print_exc(file=sys.stdout)
-                    sys.stdout.flush()
-    except Exception as e:
-        print(f"[AI ERROR] Error scanning folder {folder_path}: {e}", flush=True)
-        traceback.print_exc(file=sys.stdout)
-        sys.stdout.flush()
+    primary_filename = "ref_img_01.jpg"
+    img_path = os.path.join(folder_path, primary_filename)
+    
+    if os.path.exists(img_path):
+        try:
+            # Enforce Megapixel ceiling before opening
+            Image.MAX_IMAGE_PIXELS = 67108864
+            with open(img_path, "rb") as f:
+                raw_bytes = f.read()
+            opt_bytes = optimize_image(raw_bytes)
+            if opt_bytes:
+                img = Image.open(io.BytesIO(opt_bytes))
+                img.load()
+                images.append(img)
+            else:
+                img = Image.open(img_path)
+                img.load()
+                images.append(img)
+        except Exception as e:
+            import gc
+            gc.collect()
+            print(f"[AI ERROR] Error loading reference image {img_path}: {e}", flush=True)
+            traceback.print_exc(file=sys.stdout)
+            sys.stdout.flush()
+    else:
+        print(f"[AI ERROR] Primary reference image {img_path} not found.", flush=True)
         
     return images
 
 def get_active_flash_models(client: Optional[genai.Client] = None) -> List[str]:
     """
     Calls client.models.list(), filters for models that contain 'flash' in their name
-    and support 'generateContent'.
+    and support 'generateContent', explicitly ignoring any containing 'omni', 'audio',
+    'live', or 'preview'.
     Returns a list of available flash models.
     """
     default_fallback = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-1.5-flash"]
@@ -160,7 +180,8 @@ def get_active_flash_models(client: Optional[genai.Client] = None) -> List[str]:
                 actions = getattr(m, "supported_generation_methods", None) or []
             is_generate = "generateContent" in actions or "generate_content" in actions or any("generatecontent" in str(a).lower() for a in actions)
             if "flash" in name_lower and is_generate:
-                discovered_models.append(m.name)
+                if not any(banned in name_lower for banned in ["omni", "audio", "live", "preview"]):
+                    discovered_models.append(m.name)
 
         if not discovered_models:
             return default_fallback
@@ -168,6 +189,8 @@ def get_active_flash_models(client: Optional[genai.Client] = None) -> List[str]:
         discovered_models.sort(reverse=True)
         return discovered_models
     except Exception as e:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Error fetching active flash models: {e}", flush=True)
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
@@ -187,9 +210,13 @@ def optimize_image(image_bytes: bytes) -> Optional[bytes]:
         img = Image.open(io.BytesIO(image_bytes))
         img.load()
     except Image.DecompressionBombError as dbe:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Decompression bomb detected in optimize_image: {dbe}", flush=True)
         raise dbe
     except Exception as e:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Failed to identify or load image: {e}", flush=True)
         return None
 
@@ -206,6 +233,8 @@ def optimize_image(image_bytes: bytes) -> Optional[bytes]:
         clean_img.save(out_buf, format="JPEG", quality=85)
         return out_buf.getvalue()
     except Exception as e:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Error optimizing image: {e}", flush=True)
         traceback.print_exc(file=sys.stdout)
         sys.stdout.flush()
@@ -221,6 +250,8 @@ def verify_document(image_bytes: bytes) -> dict:
         user_image = Image.open(io.BytesIO(image_bytes))
         user_image.load()
     except Image.DecompressionBombError as dbe:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Decompression bomb detected in verify_document: {dbe}", flush=True)
         return {
             "verified": False,
@@ -236,6 +267,8 @@ def verify_document(image_bytes: bytes) -> dict:
             }
         }
     except Exception as e:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Invalid document image in verify_document: {e}", flush=True)
         return {
             "verified": False,
@@ -265,6 +298,8 @@ def verify_document(image_bytes: bytes) -> dict:
             else:
                 optimized_ref_images.append(ref_img)
         except Exception as e:
+            import gc
+            gc.collect()
             print(f"[AI ERROR] Error optimizing reference image: {e}", flush=True)
             optimized_ref_images.append(ref_img)
     
@@ -299,6 +334,8 @@ def verify_document(image_bytes: bytes) -> dict:
     try:
         opt_bytes = optimize_image(image_bytes) or image_bytes
     except Image.DecompressionBombError as dbe:
+        import gc
+        gc.collect()
         print(f"[AI ERROR] Decompression bomb in user image: {dbe}", flush=True)
         return {
             "verified": False,
@@ -313,6 +350,12 @@ def verify_document(image_bytes: bytes) -> dict:
                 "school_year_term": None
             }
         }
+    except Exception as e:
+        import gc
+        gc.collect()
+        print(f"[AI ERROR] Error optimizing user image in verify_document: {e}", flush=True)
+        opt_bytes = image_bytes
+        
     user_part = types.Part.from_bytes(data=opt_bytes, mime_type="image/jpeg")
 
     payload = []
@@ -321,132 +364,134 @@ def verify_document(image_bytes: bytes) -> dict:
     payload.append(user_part)
     payload.append(prompt)
     
-    http_opts = types.HttpOptions(timeout=30000)
-    current_key = rotate_api_key()
-    if current_key:
-        client = genai.Client(api_key=current_key, http_options=http_opts)
-    else:
-        client = genai.Client(http_options=http_opts)
+    contents = payload
+    config = types.GenerateContentConfig(
+        system_instruction=system_instruction,
+        response_mime_type="application/json",
+        response_schema=VerificationResponse,
+        temperature=0.0,
+        max_output_tokens=256
+    )
 
-    models = get_active_flash_models(client)
-    max_retries = max(len(api_keys), 3) if api_keys else 3
+    import time
+    import json
+    import re
+    import gc
+    import sys
 
-    for model_name in models:
-        for attempt in range(max_retries):
-            try:
-                config = types.GenerateContentConfig(
-                    system_instruction=system_instruction,
-                    response_mime_type="application/json",
-                    response_schema=VerificationResponse,
-                    temperature=0.0,
-                    max_output_tokens=256
-                )
-                
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-                    future = executor.submit(
-                        client.models.generate_content,
+    total_keys = len(key_pool_list) if 'key_pool_list' in globals() and key_pool_list else 1
+
+    for model_name in TARGET_MODELS:
+        keys_exhausted_on_model = 0
+        print(f"[AI ENGINE] Active Model set to: {model_name}", flush=True)
+
+        while keys_exhausted_on_model < total_keys:
+            current_key = get_current_api_key()
+            client = genai.Client(api_key=current_key)
+
+            max_demand_retries = 3
+            demand_retry_count = 0
+            call_succeeded = False
+
+            while demand_retry_count < max_demand_retries:
+                try:
+                    response = client.models.generate_content(
                         model=model_name,
-                        contents=payload,
+                        contents=contents,
                         config=config
                     )
-                    response = future.result(timeout=30)
-                
-                text_content = response.text
-                if not text_content:
-                    raise ValueError("Empty response from Gemini API.")
-                
-                cleaned_text = text_content.strip()
-                if cleaned_text.startswith("```"):
-                    lines = cleaned_text.splitlines()
-                    if lines[0].startswith("```"):
-                        lines = lines[1:]
-                    if lines and lines[-1].startswith("```"):
-                        lines = lines[:-1]
-                    cleaned_text = "\n".join(lines).strip()
-                
-                # Aggressive regex sanitization pass on the JSON string
-                cleaned_text = sanitize_payload_string(cleaned_text)
-                parsed_json = json.loads(cleaned_text)
-                
-                status = str(parsed_json.get("status", "FAIL")).upper()
-                reason = str(parsed_json.get("reason", "NONE")).upper()
-                extracted_data = parsed_json.get("extracted_data") or {}
-                
-                student_name = extracted_data.get("student_name")
-                student_number = extracted_data.get("student_number")
-                program_year_level = extracted_data.get("program_year_level")
-                school_year_term = extracted_data.get("school_year_term")
-                
-                # Sanitize extracted values
-                if student_name is not None:
-                    student_name = sanitize_extracted_field(student_name)
-                if student_number is not None:
-                    student_number = sanitize_extracted_field(student_number)
-                if program_year_level is not None:
-                    program_year_level = sanitize_extracted_field(program_year_level)
-                if school_year_term is not None:
-                    school_year_term = sanitize_extracted_field(school_year_term)
 
-                # Format student number clean string
-                student_num_str = str(student_number or "").strip()
-                
-                # Post-Processing Validation: Apply Python regex ^\d{9}$ strictly on ASCII digits
-                if status == "PASS":
-                    if not re.match(r"^[0-9]{9}$", student_num_str):
-                        status = "FAIL"
-                        reason = "INVALID_DOCUMENT"
-                
-                verified = (status == "PASS")
-                extracted_id = student_num_str
-                student_id = student_num_str if student_num_str else None
-                
-                return {
-                    "verified": verified,
-                    "status": status,
-                    "reason": reason,
-                    "extracted_id": extracted_id,
-                    "student_id": student_id,
-                    "extracted_data": {
-                        "student_name": student_name,
-                        "student_number": student_number,
-                        "program_year_level": program_year_level,
-                        "school_year_term": school_year_term
-                    }
-                }
-                
-            except Exception as e:
-                print(f"[AI ERROR] Exception during generate_content with model {model_name}: {e}", flush=True)
-                is_429 = False
-                if isinstance(e, errors.APIError):
-                    if getattr(e, "code", None) == 429 or "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e) or "ResourceExhausted" in str(e):
-                        is_429 = True
-                elif hasattr(e, "code") and getattr(e, "code") == 429:
-                    is_429 = True
-                elif "429" in str(e) or "ResourceExhausted" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-                    is_429 = True
-                    
-                if is_429:
-                    print(f"[AI ERROR] ResourceExhausted (429) on model {model_name}. Rotating API key and retrying...", flush=True)
-                    next_key = rotate_api_key()
-                    if next_key:
-                        client = genai.Client(api_key=next_key, http_options=http_opts)
-                    continue
-                else:
-                    print(f"[AI ERROR] Error with model {model_name}: {e}", flush=True)
-                    traceback.print_exc(file=sys.stdout)
-                    sys.stdout.flush()
-                    break
-                    
-    return {
-        "verified": False,
-        "status": "FAIL",
-        "reason": "Verification failed across all models or api keys.",
-        "extracted_id": "",
-        "student_id": None,
-        "extracted_data": {
-            "student_name": None,
-            "student_number": None,
-            "program_year_level": None,
-            "school_year_term": None
-        }
-    }
+                    raw_text = getattr(response, "text", "") or ""
+                    cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.MULTILINE)
+                    cleaned_text = re.sub(r"\s*```$", "", cleaned_text.strip(), flags=re.MULTILINE).strip()
+
+                    if not cleaned_text:
+                        print(f"[AI EMPTY RESPONSE] Model {model_name} returned blank output. Retrying on same key...", flush=True)
+                        demand_retry_count += 1
+                        time.sleep(2)
+                        continue
+
+                    try:
+                        # Aggressive regex sanitization pass on the JSON string before parsing
+                        cleaned_text = sanitize_payload_string(cleaned_text)
+                        parsed_json = json.loads(cleaned_text)
+                        
+                        # Post-process parsed_json to conform to expectations in bot.py and tests
+                        status = str(parsed_json.get("status", "FAIL")).upper()
+                        reason = str(parsed_json.get("reason", "NONE")).upper()
+                        extracted_data = parsed_json.get("extracted_data") or {}
+                        
+                        student_name = extracted_data.get("student_name")
+                        student_number = extracted_data.get("student_number")
+                        program_year_level = extracted_data.get("program_year_level")
+                        school_year_term = extracted_data.get("school_year_term")
+                        
+                        if student_name is not None:
+                            student_name = sanitize_extracted_field(student_name)
+                        if student_number is not None:
+                            student_number = sanitize_extracted_field(student_number)
+                        if program_year_level is not None:
+                            program_year_level = sanitize_extracted_field(program_year_level)
+                        if school_year_term is not None:
+                            school_year_term = sanitize_extracted_field(school_year_term)
+
+                        student_num_str = str(student_number or "").strip()
+                        
+                        if status == "PASS":
+                            if not re.match(r"^[0-9]{9}$", student_num_str):
+                                status = "FAIL"
+                                reason = "INVALID_DOCUMENT"
+                                
+                        parsed_json["verified"] = (status == "PASS")
+                        parsed_json["status"] = status
+                        parsed_json["reason"] = reason
+                        parsed_json["extracted_id"] = student_num_str
+                        parsed_json["student_id"] = student_num_str if student_num_str else None
+                        parsed_json["extracted_data"] = {
+                            "student_name": student_name,
+                            "student_number": student_number,
+                            "program_year_level": program_year_level,
+                            "school_year_term": school_year_term
+                        }
+                        
+                        call_succeeded = True
+                        return parsed_json
+                    except json.JSONDecodeError:
+                        print(f"[AI JSON ERROR] Unparseable response received: {cleaned_text!r}. Retrying...", flush=True)
+                        demand_retry_count += 1
+                        time.sleep(2)
+                        continue
+
+                except Exception as e:
+                    err_str = str(e).lower()
+
+                    # RULE 1: HIGH DEMAND / SERVER OVERLOAD -> RETRY ON SAME KEY & SAME MODEL
+                    if any(term in err_str for term in ["503", "504", "unavailable", "timeout", "overloaded"]):
+                        demand_retry_count += 1
+                        print(f"[AI HIGH DEMAND] {model_name} is under heavy server traffic. Retrying ({demand_retry_count}/{max_demand_retries}) on the SAME key in 3s...", flush=True)
+                        time.sleep(3)
+                        gc.collect()
+                        continue
+
+                    # RULE 2: QUOTA LIMIT REACHED -> ONLY HERE DOES THE KEY ROTATE
+                    elif any(term in err_str for term in ["429", "resource_exhausted", "quota"]):
+                        print(f"[AI QUOTA HIT] Active key exhausted quota on {model_name}. Rotating to next API key...", flush=True)
+                        rotate_api_key()
+                        keys_exhausted_on_model += 1
+                        gc.collect()
+                        break
+
+                    # OTHER ERRORS
+                    else:
+                        print(f"[AI ERROR] Exception with {model_name}: {e}", flush=True)
+                        demand_retry_count += 1
+                        time.sleep(2)
+                        gc.collect()
+                        continue
+
+            if call_succeeded:
+                break
+
+        print(f"[AI MODEL EXHAUSTED] All {total_keys} keys hit quota on {model_name}. Advancing to next model in hierarchy...", flush=True)
+
+    raise RuntimeError("Verification pipeline exhausted all models and API keys.")

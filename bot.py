@@ -114,12 +114,13 @@ class VerificationBot(commands.Bot):
             message = await self.verification_queue.get()
             user_id = message.author.id
             user_id_str = str(user_id)
+            print(f"[WORKER] Picked up verification job for user {user_id}. Starting analysis...", flush=True)
             try:
                 # We already validated the attachment in on_message, so we know message.attachments[0] exists
                 attachment = message.attachments[0]
                 
                 # Status message to indicate analysis has begun
-                status_msg = await message.reply("⏳ Analyzing...")
+                status_msg = await message.reply("⏳ Analyzing your SAI document... Please note: Verification may take a few moments while we audit your document. Thank you for your patience!")
                 
                 # Read attachment bytes (run async)
                 try:
@@ -876,9 +877,17 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 # ==================== BOT EVENTS ====================
 
 @bot.event
+async def on_ready() -> None:
+    database.reset_all_locks()
+    print(f"[GATEWAY] Logged in as {bot.user} (ID: {bot.user.id if bot.user else 'Unknown'})", flush=True)
+
+@bot.event
 async def on_message(message: discord.Message) -> None:
     if message.author.bot:
         return
+
+    is_dm = isinstance(message.channel, discord.DMChannel)
+    print(f"[GATEWAY EVENT] Message received from {message.author} (ID: {message.author.id}) | Is DM: {is_dm} | Attachments: {len(message.attachments)}", flush=True)
 
     # Check if DM channel
     if message.guild is not None:
@@ -887,6 +896,8 @@ async def on_message(message: discord.Message) -> None:
 
     # If it's a DM, make sure there is an attachment
     if not message.attachments:
+        if is_dm:
+            print(f"[IGNORED] User {message.author.id} sent text without an image attachment in DMs: {message.content!r}", flush=True)
         return
 
     user_id = message.author.id
@@ -901,6 +912,11 @@ async def on_message(message: discord.Message) -> None:
     if user_state is not None:
         strikes, is_locked = user_state
         if is_locked:
+            print(f"[REJECTED] User {message.author.id} is LOCKED in database. Prompting user...", flush=True)
+            try:
+                await message.reply("🔒 Your verification is currently locked due to previous failed attempts. Please wait for staff to review your submission in #pending-submissions.")
+            except Exception:
+                pass
             return
 
     # Process first attachment

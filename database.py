@@ -295,3 +295,10 @@ def delete_student_by_discord_id(discord_id: Union[int, str]) -> bool:
     if discord_id is None:
         return False
     return unlink_student(str(discord_id))
+
+def reset_all_locks():
+    with _connect() as conn:
+        conn.execute("UPDATE users SET strikes = 0, is_locked = 0;")
+        conn.commit()
+        print("[DATABASE] All user strikes and lockouts have been reset to 0.", flush=True)
+
