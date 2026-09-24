@@ -20,17 +20,22 @@ from typing import List, Optional, Tuple, Any, Dict
 # Target models for verification failover hierarchy
 TARGET_MODELS = [
     "gemini-3.5-flash-lite",
-    "gemini-2.5-flash"
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
 ]
 
 # Pydantic models for strictly enforcing target schema
 class ExtractedData(pydantic.BaseModel):
     student_name: Optional[str] = None
+    student_id: Optional[str] = None
     student_number: Optional[str] = None
+    program_year: Optional[str] = None
     program_year_level: Optional[str] = None
     school_year_term: Optional[str] = None
+    document_date: Optional[str] = None
 
 class VerificationResponse(pydantic.BaseModel):
+    is_valid: bool = False
     status: str  # PASS | FAIL
     reason: str  # NONE | CROPPED_IMAGE | UNREADABLE_TEXT | INVALID_DOCUMENT | SUSPECTED_TAMPERING
     extracted_data: ExtractedData
@@ -316,12 +321,13 @@ def verify_document(image_bytes: bytes) -> dict:
         "You are an STI College auditor. Your task is to verify the Student Assessment Invoice (SAI) document (the last image in the contents) "
         "by comparing it against the provided valid reference images.\n\n"
         "CRITICAL AUDITING & EXTRACTION RULES:\n"
-        "1. Extraction: Target and extract these 4 fields exactly:\n"
+        "1. Extraction: Target and extract these 5 fields exactly:\n"
+        "   - student_id: The 9-digit numerical string under 'STUDENT NUMBER' or 'STUDENT ID'\n"
         "   - student_name: The text/name under 'STUDENT NAME'\n"
-        "   - student_number: The 9-digit numerical string under 'STUDENT NUMBER'\n"
-        "   - program_year_level: The text under 'PROGRAM / YEAR LEVEL'\n"
-        "   - school_year_term: The text under 'SCHOOL YEAR AND TERM'\n"
-        "2. Edge Case A (Cropped Images): You must verify full visibility of the STI logo, header title, and all 4 field labels. "
+        "   - program_year: The text under 'PROGRAM / YEAR LEVEL' (e.g., 'BSCS, 1st Year')\n"
+        "   - school_year_term: The text under 'SCHOOL YEAR AND TERM' (e.g., '2026-2027, 1st Term')\n"
+        "   - document_date: The date string under 'DATE' (e.g., 'JUN-22-2026')\n"
+        "2. Edge Case A (Cropped Images): You must verify full visibility of the STI logo, header title, and all 5 field labels. "
         "If any border is cut off, any of these anchors/headers are not fully visible, or field labels are cut off, you must set status to 'FAIL' and reason to 'CROPPED_IMAGE'.\n"
         "3. Edge Case B (Tampering): Inspect the document for font inconsistencies, digital noise boxes around text, or alignment anomalies indicating image editing/tampering. "
         "If any such anomaly is detected, you must set status to 'FAIL' and reason to 'SUSPECTED_TAMPERING'.\n"
@@ -333,7 +339,7 @@ def verify_document(image_bytes: bytes) -> dict:
 
     prompt = (
         "Verify this final Student Assessment Invoice image. "
-        "Extract the student name, student number, program/year level, and school year/term. "
+        "Extract student_id, student_name, program_year, school_year_term, and document_date. "
         "Ensure all cropped and tampering checks are executed. Return only the JSON response conforming to the schema."
     )
     
@@ -409,7 +415,7 @@ def verify_document(image_bytes: bytes) -> dict:
                             contents=contents,
                             config=config
                         )
-                        response = future.result(timeout=12.0)
+                        response = future.result(timeout=15.0)
 
                     raw_text = getattr(response, "text", "") or ""
                     cleaned_text = re.sub(r"^```(?:json)?\s*", "", raw_text.strip(), flags=re.MULTILINE)
@@ -432,20 +438,23 @@ def verify_document(image_bytes: bytes) -> dict:
                         extracted_data = parsed_json.get("extracted_data") or {}
                         
                         student_name = extracted_data.get("student_name")
-                        student_number = extracted_data.get("student_number")
-                        program_year_level = extracted_data.get("program_year_level")
+                        student_id_val = extracted_data.get("student_id") or extracted_data.get("student_number")
+                        program_year_val = extracted_data.get("program_year") or extracted_data.get("program_year_level")
                         school_year_term = extracted_data.get("school_year_term")
+                        document_date = extracted_data.get("document_date")
                         
                         if student_name is not None:
                             student_name = sanitize_extracted_field(student_name)
-                        if student_number is not None:
-                            student_number = sanitize_extracted_field(student_number)
-                        if program_year_level is not None:
-                            program_year_level = sanitize_extracted_field(program_year_level)
+                        if student_id_val is not None:
+                            student_id_val = sanitize_extracted_field(student_id_val)
+                        if program_year_val is not None:
+                            program_year_val = sanitize_extracted_field(program_year_val)
                         if school_year_term is not None:
                             school_year_term = sanitize_extracted_field(school_year_term)
+                        if document_date is not None:
+                            document_date = sanitize_extracted_field(document_date)
 
-                        student_num_str = str(student_number or "").strip()
+                        student_num_str = str(student_id_val or "").strip()
                         
                         if status == "PASS":
                             if not re.match(r"^[0-9]{9}$", student_num_str):
@@ -459,9 +468,12 @@ def verify_document(image_bytes: bytes) -> dict:
                         parsed_json["student_id"] = student_num_str if student_num_str else None
                         parsed_json["extracted_data"] = {
                             "student_name": student_name,
-                            "student_number": student_number,
-                            "program_year_level": program_year_level,
-                            "school_year_term": school_year_term
+                            "student_id": student_id_val,
+                            "student_number": student_id_val,
+                            "program_year": program_year_val,
+                            "program_year_level": program_year_val,
+                            "school_year_term": school_year_term,
+                            "document_date": document_date
                         }
                         
                         call_succeeded = True
@@ -473,7 +485,7 @@ def verify_document(image_bytes: bytes) -> dict:
                         continue
 
                 except (concurrent.futures.TimeoutError, TimeoutError, asyncio.TimeoutError):
-                    print(f"[AI TIMEOUT] Model {model_name} timed out after 12.0s. Immediately switching to next model...", flush=True)
+                    print(f"[AI TIMEOUT/503] {model_name} failed. Immediately advancing to next model in cascade...", flush=True)
                     break
 
                 except Exception as e:
@@ -481,7 +493,7 @@ def verify_document(image_bytes: bytes) -> dict:
 
                     # RULE 1: HIGH DEMAND / SERVER OVERLOAD / 503 -> IMMEDIATELY SWITCH TO NEXT MODEL WITHOUT SLEEPING ON SAME DEAD KEY
                     if any(term in err_str for term in ["503", "504", "unavailable", "timeout", "overloaded"]):
-                        print(f"[AI HIGH DEMAND / 503] Model {model_name} hit traffic/503. Immediately switching to next model...", flush=True)
+                        print(f"[AI TIMEOUT/503] {model_name} failed. Immediately advancing to next model in cascade...", flush=True)
                         break
 
                     # RULE 2: QUOTA LIMIT REACHED -> ONLY HERE DOES THE KEY ROTATE
@@ -505,6 +517,19 @@ def verify_document(image_bytes: bytes) -> dict:
 
         print(f"[AI MODEL EXHAUSTED] All {total_keys} keys hit quota on {model_name}. Advancing to next model in hierarchy...", flush=True)
 
-    raise RuntimeError("Verification pipeline exhausted all models and API keys.")
+    return {
+        "verified": False,
+        "is_valid": False,
+        "status": "FAIL",
+        "reason": "AI verification service timed out across all available endpoints. Your document has been forwarded to human staff for review.",
+        "extracted_id": "",
+        "student_id": None,
+        "extracted_data": {
+            "student_name": None,
+            "student_number": None,
+            "program_year_level": None,
+            "school_year_term": None
+        }
+    }
 
 audit_sai_document = verify_document

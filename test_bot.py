@@ -54,11 +54,12 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         mock_user.send.side_effect = discord.Forbidden(mock_response, "Forbidden")
         mock_interaction.user = mock_user
         mock_interaction.response = AsyncMock()
+        mock_interaction.followup = AsyncMock()
         
         await dropdown.callback(mock_interaction)
         
-        # Verify ephemeral failure message
-        mock_interaction.response.send_message.assert_called_with(
+        # Verify ephemeral failure message via followup
+        mock_interaction.followup.send.assert_called_with(
             "❌ Please enable Direct Messages from server members to apply.",
             ephemeral=True
         )
@@ -70,12 +71,13 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         mock_user = AsyncMock()
         mock_interaction.user = mock_user
         mock_interaction.response = AsyncMock()
+        mock_interaction.followup = AsyncMock()
         
         await dropdown.callback(mock_interaction)
         
         mock_user.send.assert_called_once()
-        mock_interaction.response.send_message.assert_called_with(
-            "✅ Verification instructions have been sent to your DMs!",
+        mock_interaction.followup.send.assert_called_with(
+            "✅ Verification initiated! Please check your Direct Messages to proceed.",
             ephemeral=True
         )
 

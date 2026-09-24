@@ -39,6 +39,7 @@ verification_queue = asyncio.Queue()
 
 # Thread-safe global button/interaction cooldown tracker (1 request per user per 60 seconds)
 BUTTON_COOLDOWNS = {}
+active_sessions: Dict[int, Any] = {}
 
 def check_button_cooldown(user_id: int) -> Optional[float]:
     """
@@ -186,6 +187,12 @@ class VerificationBot(commands.Bot):
 
                         # PASS Logic
                         if verified:
+                            extracted_data = result.get("extracted_data", {})
+                            s_name = extracted_data.get("student_name")
+                            prog_year = extracted_data.get("program_year") or extracted_data.get("program_year_level")
+                            sy_term = extracted_data.get("school_year_term")
+                            doc_date = extracted_data.get("document_date")
+
                             student_hash = await asyncio.to_thread(database.hash_student_id, extracted_id)
                             # Atomic TOCTOU Prevention: lock per student hash
                             hash_lock = await get_lock(student_hash)
@@ -214,6 +221,8 @@ class VerificationBot(commands.Bot):
                                                 )
                                                 mod_embed.add_field(name="Applicant", value=f"<@{user_id}>", inline=True)
                                                 mod_embed.add_field(name="Existing Registered User", value=f"<@{original_discord_id}>", inline=True)
+                                                if s_name:
+                                                    mod_embed.add_field(name="Student Name", value=s_name, inline=True)
                                                 mod_embed.add_field(
                                                     name="Action Needed",
                                                     value="Staff review required via `/check-student` or `/unlink-student`.",
@@ -224,7 +233,15 @@ class VerificationBot(commands.Bot):
                                         except Exception as e:
                                             print(f"Failed to send mod log embed: {e}")
                                 else:
-                                    await asyncio.to_thread(database.add_verified_user, user_id_str, extracted_id)
+                                    await asyncio.to_thread(
+                                        database.add_verified_user,
+                                        user_id_str,
+                                        extracted_id,
+                                        student_name=s_name,
+                                        program_year=prog_year,
+                                        school_year_term=sy_term,
+                                        document_date=doc_date
+                                    )
                                     
                                     guild_id = int(os.environ.get("GUILD_ID", 0))
                                     guild = (channel.guild if channel and hasattr(channel, "guild") else None) or self.get_guild(guild_id)
@@ -246,6 +263,14 @@ class VerificationBot(commands.Bot):
                                         color=discord.Color.green()
                                     )
                                     success_embed.add_field(name="Student ID", value=extracted_id, inline=True)
+                                    if s_name:
+                                        success_embed.add_field(name="Student Name", value=s_name, inline=True)
+                                    if prog_year:
+                                        success_embed.add_field(name="Program & Year", value=prog_year, inline=True)
+                                    if sy_term:
+                                        success_embed.add_field(name="School Year & Term", value=sy_term, inline=True)
+                                    if doc_date:
+                                        success_embed.add_field(name="Document Date", value=doc_date, inline=True)
                                     if role_assigned:
                                         success_embed.add_field(name="Role Assigned", value="Verified Student", inline=True)
                                     else:
@@ -454,10 +479,19 @@ class VerifyDropdown(discord.ui.Select):
     async def callback(self, interaction: discord.Interaction) -> None:
         user = interaction.user
         
+        # Immediate defer to prevent 10062 Unknown interaction expiry
+        await interaction.response.defer(ephemeral=True)
+
+        # Clear session tracking dictionaries and sets so dropdown is never unresponsive
+        if interaction.client and hasattr(interaction.client, "processing_users"):
+            interaction.client.processing_users.discard(user.id)
+        if 'active_sessions' in globals():
+            active_sessions.pop(user.id, None)
+
         # Enforce button interaction cooldown
         cooldown_left = check_button_cooldown(user.id)
         if cooldown_left is not None:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⚠️ Please wait {cooldown_left:.1f} seconds before requesting verification again.",
                 ephemeral=True
             )
@@ -474,12 +508,12 @@ class VerifyDropdown(discord.ui.Select):
                 color=discord.Color.blue()
             )
             await user.send(embed=embed, view=view)
-            await interaction.response.send_message(
-                "✅ Verification instructions have been sent to your DMs!",
+            await interaction.followup.send(
+                "✅ Verification initiated! Please check your Direct Messages to proceed.",
                 ephemeral=True
             )
         except discord.Forbidden:
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 "❌ Please enable Direct Messages from server members to apply.",
                 ephemeral=True
             )
@@ -533,6 +567,12 @@ class DMStartCancelView(discord.ui.View):
             )
             return
             
+        # Purge user from active verification tracking / session state dictionaries
+        if interaction.client and hasattr(interaction.client, "processing_users"):
+            interaction.client.processing_users.discard(interaction.user.id)
+        if 'active_sessions' in globals():
+            active_sessions.pop(interaction.user.id, None)
+
         await interaction.response.send_message("❌ Verification cancelled. You can restart anytime using the dropdown.")
 
 class StaffButtonsView(discord.ui.View):
@@ -806,6 +846,10 @@ async def check_student(
     )
     embed.add_field(name="Registered User", value=f"<@{discord_id}> ({discord_id})", inline=False)
     embed.add_field(name="Student ID Hash", value=student_id_hash, inline=False)
+    embed.add_field(name="Student Name", value=record.get("student_name") or "N/A", inline=True)
+    embed.add_field(name="Program & Year", value=record.get("program_year") or "N/A", inline=True)
+    embed.add_field(name="School Year & Term", value=record.get("school_year_term") or "N/A", inline=True)
+    embed.add_field(name="Document Date", value=record.get("document_date") or "N/A", inline=True)
     embed.add_field(name="Registration Date", value=timestamp, inline=True)
     embed.add_field(name="Current Status", value=status, inline=True)
 
