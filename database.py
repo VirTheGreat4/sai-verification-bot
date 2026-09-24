@@ -47,9 +47,18 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS verified_students (
                 discord_id INTEGER PRIMARY KEY,
                 student_hash TEXT NOT NULL UNIQUE,
-                verified_at TEXT NOT NULL
+                verified_at TEXT NOT NULL,
+                student_name TEXT,
+                program_year TEXT,
+                school_year_term TEXT,
+                document_date TEXT
             ) STRICT;
         """)
+        for col, col_type in [("student_name", "TEXT"), ("program_year", "TEXT"), ("school_year_term", "TEXT"), ("document_date", "TEXT")]:
+            try:
+                cursor.execute(f"ALTER TABLE verified_students ADD COLUMN {col} {col_type};")
+            except sqlite3.OperationalError:
+                pass
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 discord_id TEXT PRIMARY KEY,
@@ -75,7 +84,14 @@ def is_student_registered(sha256_hash: str) -> bool:
             return hmac.compare_digest(row[0], sha256_hash)
         return False
 
-def register_student(discord_id: str, sha256_hash: str) -> None:
+def register_student(
+    discord_id: Union[int, str],
+    sha256_hash: str,
+    student_name: Optional[str] = None,
+    program_year: Optional[str] = None,
+    school_year_term: Optional[str] = None,
+    document_date: Optional[str] = None
+) -> None:
     """
     Registers or updates a student in the database.
     Resets strikes and is_locked on conflict.
@@ -84,12 +100,16 @@ def register_student(discord_id: str, sha256_hash: str) -> None:
         cursor = conn.cursor()
         # Insert/update in verified_students
         cursor.execute("""
-            INSERT INTO verified_students (discord_id, student_hash, verified_at)
-            VALUES (?, ?, CURRENT_TIMESTAMP)
+            INSERT INTO verified_students (discord_id, student_hash, verified_at, student_name, program_year, school_year_term, document_date)
+            VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, ?, ?)
             ON CONFLICT(discord_id) DO UPDATE SET
                 student_hash = excluded.student_hash,
-                verified_at = CURRENT_TIMESTAMP
-        """, (int(discord_id), sha256_hash))
+                verified_at = CURRENT_TIMESTAMP,
+                student_name = COALESCE(excluded.student_name, student_name),
+                program_year = COALESCE(excluded.program_year, program_year),
+                school_year_term = COALESCE(excluded.school_year_term, school_year_term),
+                document_date = COALESCE(excluded.document_date, document_date)
+        """, (int(discord_id), sha256_hash, student_name, program_year, school_year_term, document_date))
         
         # Insert/update in users for strikes and lock compatibility
         cursor.execute("""
@@ -139,12 +159,29 @@ def unlink_student(identifier: str) -> bool:
 
 # ==================== BACKWARD COMPATIBLE WRAPPERS ====================
 
-def add_verified_user(discord_id: str, student_id: str) -> None:
+def add_verified_user(
+    discord_id: Union[int, str],
+    student_id_hash: str,
+    student_name: Optional[str] = None,
+    program_year: Optional[str] = None,
+    school_year_term: Optional[str] = None,
+    document_date: Optional[str] = None
+) -> None:
     """
     Saves a successful verification (wrapper around register_student).
     """
-    hashed_id = hash_student_id(student_id)
-    register_student(discord_id, hashed_id)
+    if student_id_hash and len(student_id_hash) == 64 and all(c in '0123456789abcdefABCDEF' for c in student_id_hash):
+        hashed_id = student_id_hash
+    else:
+        hashed_id = hash_student_id(student_id_hash)
+    register_student(
+        discord_id,
+        hashed_id,
+        student_name=student_name,
+        program_year=program_year,
+        school_year_term=school_year_term,
+        document_date=document_date
+    )
 
 def is_student_id_used(student_id: str) -> bool:
     """
@@ -225,15 +262,15 @@ def unlock_user(discord_id: str) -> None:
 
 def get_student_by_id(student_id: str) -> Optional[Dict[str, Any]]:
     """
-    Hash incoming student_id and return dict with student_id_hash, discord_id (int), and timestamp,
-    or None if not found.
+    Hash incoming student_id and return dict with student_id_hash, discord_id (int), timestamp,
+    and credential fields, or None if not found.
     """
     if not student_id:
         return None
     hashed_id = hash_student_id(student_id)
     with _connect() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT student_hash, discord_id, verified_at FROM verified_students")
+        cursor.execute("SELECT student_hash, discord_id, verified_at, student_name, program_year, school_year_term, document_date FROM verified_students")
         rows = cursor.fetchall()
         for row in rows:
             if hmac.compare_digest(row[0], hashed_id) or hmac.compare_digest(row[0], student_id):
@@ -245,14 +282,18 @@ def get_student_by_id(student_id: str) -> Optional[Dict[str, Any]]:
                 return {
                     "student_id_hash": row[0],
                     "discord_id": d_id,
-                    "timestamp": row[2]
+                    "timestamp": row[2],
+                    "student_name": row[3],
+                    "program_year": row[4],
+                    "school_year_term": row[5],
+                    "document_date": row[6]
                 }
         return None
 
 def get_student_by_discord_id(discord_id: Union[int, str]) -> Optional[Dict[str, Any]]:
     """
-    Query table by discord_id and return dict with student_id_hash, discord_id (int), and timestamp,
-    or None if not found.
+    Query table by discord_id and return dict with student_id_hash, discord_id (int), timestamp,
+    and credential fields, or None if not found.
     """
     if discord_id is None:
         return None
@@ -260,7 +301,7 @@ def get_student_by_discord_id(discord_id: Union[int, str]) -> Optional[Dict[str,
     with _connect() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT student_hash, discord_id, verified_at FROM verified_students WHERE discord_id = ?",
+            "SELECT student_hash, discord_id, verified_at, student_name, program_year, school_year_term, document_date FROM verified_students WHERE discord_id = ?",
             (d_int,)
         )
         row = cursor.fetchone()
@@ -273,7 +314,11 @@ def get_student_by_discord_id(discord_id: Union[int, str]) -> Optional[Dict[str,
             return {
                 "student_id_hash": row[0],
                 "discord_id": d_id,
-                "timestamp": row[2]
+                "timestamp": row[2],
+                "student_name": row[3],
+                "program_year": row[4],
+                "school_year_term": row[5],
+                "document_date": row[6]
             }
         return None
 

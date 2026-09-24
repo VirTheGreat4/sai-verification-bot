@@ -91,6 +91,22 @@ class TestDatabase(unittest.TestCase):
         self.assertTrue(database.is_student_id_used("student456"))
         self.assertFalse(database.is_student_id_used("nonexistent"))
 
+    def test_add_verified_user_with_credentials(self) -> None:
+        database.add_verified_user(
+            discord_id=123456,
+            student_id_hash="student456",
+            student_name="Juan Dela Cruz",
+            program_year="BSCS, 1st Year",
+            school_year_term="2026-2027, 1st Term",
+            document_date="JUN-22-2026"
+        )
+        record = database.get_student_by_discord_id(123456)
+        self.assertIsNotNone(record)
+        self.assertEqual(record["student_name"], "Juan Dela Cruz")
+        self.assertEqual(record["program_year"], "BSCS, 1st Year")
+        self.assertEqual(record["school_year_term"], "2026-2027, 1st Term")
+        self.assertEqual(record["document_date"], "JUN-22-2026")
+
     def test_add_verified_user_existing(self) -> None:
         database.add_verified_user("123456", "student456")
         database.add_verified_user("123456", "student789")

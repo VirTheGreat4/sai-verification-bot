@@ -177,6 +177,9 @@ class VerificationBot(commands.Bot):
                         result = await asyncio.to_thread(ai_engine.audit_sai_document, optimized_bytes)
 
                         verified = result.get("verified", False)
+                        is_valid = result.get("is_valid", True)
+                        if not is_valid:
+                            verified = False
                         reason = result.get("reason", "Verification unsuccessful.")
                         extracted_id = result.get("extracted_id", "").strip()
 
