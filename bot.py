@@ -100,6 +100,7 @@ class VerificationBot(commands.Bot):
         self.add_view(VerifyDropdownView())
         self.add_view(DMStartCancelView())
         self.add_view(StaffButtonsView())
+        self.add_view(RequestCorrectionView())
         
         # Sync slash commands
         await self.tree.sync()
@@ -279,11 +280,15 @@ class VerificationBot(commands.Bot):
                                     else:
                                         success_embed.add_field(name="Role Status", value="Role pending assignment.", inline=True)
                                         
+                                    correction_view = RequestCorrectionView(
+                                        user_id=user_id,
+                                        image_url=item["url"],
+                                        current_details=result
+                                    )
                                     if status_msg:
-                                        await status_msg.edit(content="✅ Analysis complete!")
-                                    if channel:
-                                        await channel.send(embed=success_embed)
-                                    continue
+                                        await status_msg.edit(content="✅ Analysis complete!", embed=success_embed, view=correction_view)
+                                    elif channel:
+                                        await channel.send(embed=success_embed, view=correction_view)
 
                         # FAIL Logic (Warning or Lock)
                         await asyncio.to_thread(database.add_strike, user_id_str)
@@ -578,9 +583,197 @@ class DMStartCancelView(discord.ui.View):
 
         await interaction.response.send_message("❌ Verification cancelled. You can restart anytime using the dropdown.")
 
-class StaffButtonsView(discord.ui.View):
-    def __init__(self) -> None:
+class RequestCorrectionView(discord.ui.View):
+    def __init__(
+        self,
+        user_id: Optional[int] = None,
+        image_url: Optional[str] = None,
+        current_details: Optional[Dict[str, Any]] = None
+    ) -> None:
         super().__init__(timeout=None)
+        self.user_id = user_id
+        self.image_url = image_url
+        self.url = image_url
+        self.current_details = current_details or {}
+
+    @discord.ui.button(
+        label="Report Info Mistake",
+        style=discord.ButtonStyle.secondary,
+        emoji="✏️",
+        custom_id="report_mistake_btn"
+    )
+    async def report_mistake(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        await interaction.response.defer(ephemeral=True)
+        button.disabled = True
+        try:
+            await interaction.message.edit(view=self)
+        except Exception:
+            pass
+
+        user_id = interaction.user.id
+        user_id_str = str(user_id)
+
+        record = await asyncio.to_thread(database.get_student_by_discord_id, user_id)
+        current_name = record.get("student_name") if record else "N/A"
+        current_program = record.get("program_year") if record else "N/A"
+        current_term = record.get("school_year_term") if record else "N/A"
+        current_date = record.get("document_date") if record else "N/A"
+        current_id_hash = record.get("student_id_hash") if record else "N/A"
+
+        image_bytes = None
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(self.url) as resp:
+                    if resp.status == 200:
+                        image_bytes = await resp.read()
+        except Exception as e:
+            print(f"Failed to re-download verification image for correction: {e}")
+
+        pending_channel_id = int(os.environ.get("PENDING_CHANNEL_ID", 0))
+        guild_id = int(os.environ.get("GUILD_ID", 0))
+        guild = interaction.guild or bot.get_guild(guild_id)
+        pending_channel = None
+        if guild:
+            pending_channel = guild.get_channel(pending_channel_id)
+            if not pending_channel:
+                try:
+                    pending_channel = await guild.fetch_channel(pending_channel_id)
+                except Exception:
+                    pass
+        if not pending_channel:
+            pending_channel = bot.get_channel(pending_channel_id)
+
+        if pending_channel:
+            staff_embed = discord.Embed(
+                title="📝 Student Detail Correction Requested",
+                description="A verified student has requested a manual correction to their extracted document details.",
+                color=discord.Color.orange()
+            )
+            staff_embed.add_field(name="User Mention", value=f"<@{user_id}>", inline=True)
+            staff_embed.add_field(name="User ID", value=user_id_str, inline=True)
+            staff_embed.add_field(name="Student ID Hash", value=current_id_hash[:16] + "..." if current_id_hash != "N/A" else "N/A", inline=True)
+            staff_embed.add_field(name="Current Name", value=current_name, inline=True)
+            staff_embed.add_field(name="Current Program", value=current_program, inline=True)
+            staff_embed.add_field(name="Current Term", value=current_term, inline=True)
+            staff_embed.add_field(name="Current Date", value=current_date, inline=True)
+
+            view = StaffButtonsView(user_id=user_id, current_data=record)
+            try:
+                if image_bytes:
+                    file_to_forward = discord.File(io.BytesIO(image_bytes), filename="sai_correction.jpg")
+                    await pending_channel.send(embed=staff_embed, file=file_to_forward, view=view)
+                else:
+                    await pending_channel.send(embed=staff_embed, view=view)
+            except Exception as e:
+                print(f"Failed to forward correction request to pending channel: {e}")
+
+        if image_bytes is not None:
+            del image_bytes
+        gc.collect()
+
+        await interaction.followup.send(
+            "✅ Your correction request has been forwarded to server staff. You will retain your verified role while staff reviews your document.",
+            ephemeral=True
+        )
+
+class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
+    def __init__(self, user_id: int, current_data: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__()
+        self.user_id = user_id
+        current_data = current_data or {}
+
+        self.student_name = discord.ui.TextInput(
+            label="Student Name",
+            default=current_data.get("student_name", ""),
+            max_length=100,
+            required=True
+        )
+        self.program_year = discord.ui.TextInput(
+            label="Program & Year",
+            default=current_data.get("program_year", ""),
+            max_length=50,
+            required=True
+        )
+        self.school_year_term = discord.ui.TextInput(
+            label="School Year & Term",
+            default=current_data.get("school_year_term", ""),
+            max_length=50,
+            required=True
+        )
+        self.document_date = discord.ui.TextInput(
+            label="Document Date",
+            default=current_data.get("document_date", ""),
+            max_length=30,
+            required=True
+        )
+
+        self.add_item(self.student_name)
+        self.add_item(self.program_year)
+        self.add_item(self.school_year_term)
+        self.add_item(self.document_date)
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        name = self.student_name.value.strip()
+        program = self.program_year.value.strip()
+        term = self.school_year_term.value.strip()
+        date = self.document_date.value.strip()
+
+        await asyncio.to_thread(
+            database.update_student_details,
+            self.user_id,
+            name,
+            program,
+            term,
+            date
+        )
+
+        if interaction.message and interaction.message.embeds:
+            embed = interaction.message.embeds[0]
+            new_embed = discord.Embed.from_dict(embed.to_dict())
+            new_embed.color = discord.Color.green()
+            new_embed.add_field(name="Status", value=f"✅ Corrected by {interaction.user.mention}", inline=False)
+            
+            view = interaction.message.view
+            if view:
+                for child in view.children:
+                    child.disabled = True
+                await interaction.response.edit_message(embed=new_embed, view=view)
+            else:
+                await interaction.response.edit_message(embed=new_embed)
+        else:
+            await interaction.response.send_message("Student details updated successfully.", ephemeral=True)
+
+        guild = interaction.guild
+        target_member = await fetch_member_safely(guild, self.user_id) if guild else None
+        if target_member:
+            try:
+                dm_embed = discord.Embed(
+                    title="Student Information Updated",
+                    description=f"🎉 Staff has corrected your student information:\n**Name:** {name}\n**Program:** {program}\n**Term:** {term}\n**Date:** {date}",
+                    color=discord.Color.green()
+                )
+                await target_member.send(embed=dm_embed)
+            except Exception as e:
+                print(f"Failed to DM corrected student {self.user_id}: {e}")
+
+        if guild:
+            log_embed = discord.Embed(
+                title="✏️ Support Audit Log: Student Details Corrected",
+                description=f"Staff {interaction.user.mention} corrected student information for <@{self.user_id}>.",
+                color=discord.Color.green()
+            )
+            log_embed.add_field(name="Student", value=f"<@{self.user_id}>", inline=True)
+            log_embed.add_field(name="Name", value=name, inline=True)
+            log_embed.add_field(name="Program", value=program, inline=True)
+            log_embed.add_field(name="Term", value=term, inline=True)
+            log_embed.add_field(name="Date", value=date, inline=True)
+            await send_audit_log(guild, log_embed)
+
+class StaffButtonsView(discord.ui.View):
+    def __init__(self, user_id: Optional[int] = None, current_data: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.current_data = current_data
 
     @discord.ui.button(
         label="Accept",
@@ -753,6 +946,55 @@ class StaffButtonsView(discord.ui.View):
         new_embed.color = discord.Color.red()
         new_embed.add_field(name="Status", value=f"❌ Denied by {member.mention}", inline=False)
         await interaction.response.edit_message(embed=new_embed, view=self)
+
+    @discord.ui.button(
+        label="Edit Details",
+        style=discord.ButtonStyle.primary,
+        emoji="✏️",
+        custom_id="persistent:staff_edit_details_btn"
+    )
+    async def edit_details(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ Error: Must be used in a server.", ephemeral=True)
+            return
+
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+        except Exception:
+            await interaction.response.send_message("❌ Error: Member not found.", ephemeral=True)
+            return
+
+        support_role_id = int(os.environ.get("SUPPORT_ROLE_ID", 0))
+        is_authorized = any(role.id == support_role_id for role in member.roles) or member.guild_permissions.administrator
+        if not is_authorized:
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
+            return
+
+        if not interaction.message or not interaction.message.embeds:
+            await interaction.response.send_message("❌ Error: Embed message not found.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        parsed_user_id = self.user_id
+        if not parsed_user_id:
+            for field in embed.fields:
+                if field.name == "User ID":
+                    try:
+                        parsed_user_id = int(field.value)
+                    except ValueError:
+                        pass
+
+        if not parsed_user_id:
+            await interaction.response.send_message("❌ Error: Could not parse User ID.", ephemeral=True)
+            return
+
+        record = self.current_data
+        if not record:
+            record = await asyncio.to_thread(database.get_student_by_discord_id, parsed_user_id)
+
+        modal = StudentEditModal(user_id=parsed_user_id, current_data=record)
+        await interaction.response.send_modal(modal)
 
 
 bot = VerificationBot()

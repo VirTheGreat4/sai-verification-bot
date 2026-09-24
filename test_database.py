@@ -246,5 +246,31 @@ class TestDatabase(unittest.TestCase):
                     (b"\x00\x01\x02", "some_hash", "2025-01-01")
                 )
 
+    def test_update_student_details(self) -> None:
+        database.add_verified_user(
+            discord_id=123456,
+            student_id_hash="student456",
+            student_name="Old Name",
+            program_year="Old Program",
+            school_year_term="Old Term",
+            document_date="OLD-DATE"
+        )
+        updated = database.update_student_details(
+            discord_id=123456,
+            student_name="New Name",
+            program_year="New Program",
+            school_year_term="New Term",
+            document_date="NEW-DATE"
+        )
+        self.assertTrue(updated)
+        record = database.get_student_by_discord_id(123456)
+        self.assertEqual(record["student_name"], "New Name")
+        self.assertEqual(record["program_year"], "New Program")
+        self.assertEqual(record["school_year_term"], "New Term")
+        self.assertEqual(record["document_date"], "NEW-DATE")
+
+        # Test updating non-existent user returns False
+        self.assertFalse(database.update_student_details(999999, "X", "Y", "Z", "W"))
+
 if __name__ == "__main__":
     unittest.main()

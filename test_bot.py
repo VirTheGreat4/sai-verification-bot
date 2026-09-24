@@ -40,7 +40,7 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         await test_bot.setup_hook()
         
         mock_init_db.assert_called_once()
-        self.assertEqual(test_bot.add_view.call_count, 3)
+        self.assertEqual(test_bot.add_view.call_count, 4)
         mock_sync.assert_called_once()
 
     async def test_verify_dropdown_forbidden(self) -> None:

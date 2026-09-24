@@ -347,3 +347,24 @@ def reset_all_locks():
         conn.commit()
         print("[DATABASE] All user strikes and lockouts have been reset to 0.", flush=True)
 
+def update_student_details(
+    discord_id: Union[int, str],
+    student_name: str,
+    program_year: str,
+    school_year_term: str,
+    document_date: str
+) -> bool:
+    """Updates student metadata in the verified_students table."""
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            """
+            UPDATE verified_students
+            SET student_name = ?, program_year = ?, school_year_term = ?, document_date = ?
+            WHERE discord_id = ?;
+            """,
+            (student_name, program_year, school_year_term, document_date, int(discord_id))
+        )
+        conn.commit()
+        return cursor.rowcount > 0
+
