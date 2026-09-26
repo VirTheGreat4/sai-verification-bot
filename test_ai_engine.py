@@ -98,7 +98,7 @@ class TestAIEngine(unittest.TestCase):
         # Mock model response conforming to new Pydantic target schema
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = '{"status": "PASS", "reason": "NONE", "extracted_data": {"student_name": "Test Student", "student_number": "123456789", "program_year_level": "BSCS 3rd Year", "school_year_term": "2025-2026 1st Sem"}}'
+        mock_response.text = '{"status": "PASS", "reason": "NONE", "extracted_data": {"student_name": "Test Student", "student_number": "123456789", "program_year_level": "BSCS 3rd Year", "school_year_term": "2025-2026 1st Sem", "ms_office_email": "test.123456789@students.sti.edu"}}'
         mock_client.models.generate_content.return_value = mock_response
         mock_client_cls.return_value = mock_client
         
@@ -131,7 +131,7 @@ class TestAIEngine(unittest.TestCase):
         ex_429 = errors.APIError(429, "RESOURCE_EXHAUSTED", "Rate limit exceeded")
         
         mock_response = MagicMock()
-        mock_response.text = '{"status": "FAIL", "reason": "INVALID_DOCUMENT", "extracted_data": {"student_name": null, "student_number": null, "program_year_level": null, "school_year_term": null}}'
+        mock_response.text = '{"status": "FAIL", "reason": "INVALID_DOCUMENT", "extracted_data": {"student_name": null, "student_number": null, "program_year_level": null, "school_year_term": null, "ms_office_email": null}}'
         
         mock_client.models.generate_content.side_effect = [ex_429, mock_response]
         mock_client_cls.return_value = mock_client
@@ -192,7 +192,7 @@ class TestAIEngine(unittest.TestCase):
         # Mock model response for a prompt injection jailbreak attempt where the model returned SUSPECTED_TAMPERING
         mock_client = MagicMock()
         mock_response = MagicMock()
-        mock_response.text = '{"status": "FAIL", "reason": "SUSPECTED_TAMPERING", "extracted_data": {"student_name": null, "student_number": null, "program_year_level": null, "school_year_term": null}}'
+        mock_response.text = '{"status": "FAIL", "reason": "SUSPECTED_TAMPERING", "extracted_data": {"student_name": null, "student_number": null, "program_year_level": null, "school_year_term": null, "ms_office_email": null}}'
         mock_client.models.generate_content.return_value = mock_response
         mock_client_cls.return_value = mock_client
         

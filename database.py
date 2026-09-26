@@ -37,12 +37,20 @@ def _connect() -> sqlite3.Connection:
     conn.execute("PRAGMA synchronous=NORMAL;")
     return conn
 
+def checkpoint_db() -> None:
+    """
+    Truncates WAL file to ensure bot.db-wal size remains <1MB on disk.
+    """
+    with _connect() as conn:
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+
 def init_db() -> None:
     """
     Initializes the database and creates the tables in STRICT mode.
     """
     with _connect() as conn:
         cursor = conn.cursor()
+        cursor.execute("PRAGMA wal_autocheckpoint = 100;")
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS verified_students (
                 discord_id INTEGER PRIMARY KEY,

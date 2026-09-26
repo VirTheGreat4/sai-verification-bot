@@ -33,6 +33,7 @@ class ExtractedData(pydantic.BaseModel):
     program_year_level: Optional[str] = None
     school_year_term: Optional[str] = None
     document_date: Optional[str] = None
+    ms_office_email: Optional[str] = None
 
 class VerificationResponse(pydantic.BaseModel):
     is_valid: bool = False
@@ -326,14 +327,16 @@ def verify_document(image_bytes: bytes) -> dict:
         "- You MUST evaluate IMAGE 2 ONLY. Do NOT extract data from Image 1.\n"
         "- If Image 2 is NOT an STI Student Assessment Invoice (e.g. it is a pet, animal, landscape, meme, selfie, or unrelated object), you MUST immediately return:\n"
         "  {\"is_valid\": false, \"reason\": \"The uploaded image is not a valid STI Student Assessment Invoice (SAI). Please upload a clear photo of your official document.\"}\n"
-        "- Image 2 MUST contain the header 'STI EDUCATION SERVICES GROUP, INC.' and 'STUDENT ASSESSMENT INVOICE'. If missing, mark is_valid as false.\n\n"
+        "- Image 2 MUST contain the header 'STI EDUCATION SERVICES GROUP, INC.' and 'STUDENT ASSESSMENT INVOICE'. If missing, mark is_valid as false.\n"
+        "- SECURITY CROSS-CHECK: You must extract the MS Office Email. The email contains the student's ID number before the @ symbol (e.g., name.123456789@...). You MUST verify that the numbers inside the email perfectly match the primary 'Student ID' field. If they do not match, it indicates a manipulated document. Set `is_valid: false` and provide reason: 'Security integrity check failed. Document details do not match.'\n\n"
         "CRITICAL AUDITING & EXTRACTION RULES:\n"
-        "1. Extraction: Target and extract these 5 fields exactly:\n"
+        "1. Extraction: Target and extract these fields exactly:\n"
         "   - student_id: The 9-digit numerical string under 'STUDENT NUMBER' or 'STUDENT ID'\n"
         "   - student_name: The text/name under 'STUDENT NAME'\n"
         "   - program_year: The text under 'PROGRAM / YEAR LEVEL' (e.g., 'BSCS, 1st Year')\n"
         "   - school_year_term: The text under 'SCHOOL YEAR AND TERM' (e.g., '2026-2027, 1st Term')\n"
         "   - document_date: The date string under 'DATE' (e.g., 'JUN-22-2026')\n"
+        "   - ms_office_email: The exact email address from the MS OFFICE field\n"
         "2. Edge Case A (Cropped Images): You must verify full visibility of the STI logo, header title, and all 5 field labels. "
         "If any border is cut off, any of these anchors/headers are not fully visible, or field labels are cut off, you must set is_valid to false, status to 'FAIL' and reason to 'CROPPED_IMAGE'.\n"
         "3. Edge Case B (Tampering): Inspect the document for font inconsistencies, digital noise boxes around text, or alignment anomalies indicating image editing/tampering. "
@@ -346,8 +349,8 @@ def verify_document(image_bytes: bytes) -> dict:
 
     prompt = (
         "Verify this final Student Assessment Invoice image. "
-        "Extract student_id, student_name, program_year, school_year_term, and document_date. "
-        "Ensure all cropped and tampering checks are executed. Return only the JSON response conforming to the schema."
+        "Extract student_id, student_name, program_year, school_year_term, document_date, and ms_office_email. "
+        "Ensure all cropped, tampering, and anti-spoofing cross-checks are executed. Return only the JSON response conforming to the schema."
     )
     
     # Downscale user image to safe JPEG bytes
@@ -455,6 +458,7 @@ def verify_document(image_bytes: bytes) -> dict:
                         program_year_val = extracted_data.get("program_year") or extracted_data.get("program_year_level")
                         school_year_term = extracted_data.get("school_year_term")
                         document_date = extracted_data.get("document_date")
+                        ms_office_email = extracted_data.get("ms_office_email")
                         
                         if student_name is not None:
                             student_name = sanitize_extracted_field(student_name)
@@ -466,6 +470,8 @@ def verify_document(image_bytes: bytes) -> dict:
                             school_year_term = sanitize_extracted_field(school_year_term)
                         if document_date is not None:
                             document_date = sanitize_extracted_field(document_date)
+                        if ms_office_email is not None:
+                            ms_office_email = sanitize_extracted_field(ms_office_email)
 
                         student_num_str = str(student_id_val or "").strip()
                         
@@ -488,7 +494,8 @@ def verify_document(image_bytes: bytes) -> dict:
                             "program_year": program_year_val,
                             "program_year_level": program_year_val,
                             "school_year_term": school_year_term,
-                            "document_date": document_date
+                            "document_date": document_date,
+                            "ms_office_email": ms_office_email
                         }
                         
                         call_succeeded = True

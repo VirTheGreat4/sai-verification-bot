@@ -11,6 +11,7 @@ import discord
 import hashlib
 import aiohttp
 import gc
+import ctypes
 from PIL import Image
 
 # Enforce an absolute 64 Megapixel ceiling to prevent decompression bombs (DoS)
@@ -140,13 +141,54 @@ class VerificationBot(commands.Bot):
                     if channel:
                         status_msg = await channel.send("⏳ Analyzing your SAI document... Please note: Verification may take a few moments while we audit your document. Thank you for your patience!")
                     
-                    # Download raw image bytes from url using async aiohttp.ClientSession directly into memory
+                    # Download raw image bytes from url using async aiohttp.ClientSession streaming download with 15MB limit
+                    MAX_DOWNLOAD_SIZE = 15 * 1024 * 1024
                     async with aiohttp.ClientSession() as session:
                         async with session.get(url) as resp:
-                            if resp.status == 200:
-                                image_bytes = await resp.read()
-                            else:
+                            if resp.status != 200:
                                 raise RuntimeError(f"Failed to download image from URL, status {resp.status}")
+                            
+                            if resp.content_length and resp.content_length > MAX_DOWNLOAD_SIZE:
+                                user = self.get_user(user_id) or await self.fetch_user(user_id)
+                                if user:
+                                    try:
+                                        await user.send("❌ File exceeds maximum 15MB limit.")
+                                    except discord.Forbidden:
+                                        print(f"[GATEWAY] Warning: Cannot deliver DM to user {user_id}. DMs closed or blocked.")
+                                    except Exception:
+                                        pass
+                                if status_msg:
+                                    try:
+                                        await status_msg.edit(content="❌ File exceeds maximum 15MB limit.")
+                                    except Exception:
+                                        pass
+                                continue
+                            
+                            chunks = []
+                            total_bytes = 0
+                            async for chunk in resp.content.iter_chunked(65536):
+                                total_bytes += len(chunk)
+                                if total_bytes > MAX_DOWNLOAD_SIZE:
+                                    break
+                                chunks.append(chunk)
+                            
+                            if total_bytes > MAX_DOWNLOAD_SIZE:
+                                user = self.get_user(user_id) or await self.fetch_user(user_id)
+                                if user:
+                                    try:
+                                        await user.send("❌ File exceeds maximum 15MB limit.")
+                                    except discord.Forbidden:
+                                        print(f"[GATEWAY] Warning: Cannot deliver DM to user {user_id}. DMs closed or blocked.")
+                                    except Exception:
+                                        pass
+                                if status_msg:
+                                    try:
+                                        await status_msg.edit(content="❌ File exceeds maximum 15MB limit.")
+                                    except Exception:
+                                        pass
+                                continue
+                            
+                            image_bytes = b"".join(chunks)
 
                     # Magic Bytes File Signature Verification: Do NOT trust Discord's attachment.content_type
                     if not verify_magic_bytes(image_bytes):
@@ -181,7 +223,9 @@ class VerificationBot(commands.Bot):
                         is_valid = result.get("is_valid", True)
                         if not is_valid:
                             verified = False
-                        reason = result.get("reason", "Verification unsuccessful.")
+                        reason = result.get("reason") or "Document could not be validated as an official STI SAI."
+                        if reason == "NONE" or not reason:
+                            reason = "Document could not be validated as an official STI SAI."
                         extracted_id = result.get("extracted_id", "").strip()
 
                         if reason == "DECOMPRESSION_BOMB":
@@ -201,8 +245,16 @@ class VerificationBot(commands.Bot):
                             # Atomic TOCTOU Prevention: lock per student hash
                             hash_lock = await get_lock(student_hash)
                             async with hash_lock:
-                                is_used = await asyncio.to_thread(database.is_student_id_used, extracted_id)
-                                if is_used:
+                                db_success = await asyncio.to_thread(
+                                    database.add_verified_user,
+                                    discord_id=user_id_str,
+                                    student_id_hash=extracted_id,
+                                    student_name=s_name,
+                                    program_year=prog_year,
+                                    school_year_term=sy_term,
+                                    document_date=doc_date
+                                )
+                                if not db_success:
                                     # Treat as duplicate -> Fail
                                     verified = False
                                     reason = f"Duplicate verification: Student ID '{extracted_id}' is already registered to another user."
@@ -236,17 +288,18 @@ class VerificationBot(commands.Bot):
                                                 self.sent_audit_logs[msg.id] = mod_embed
                                         except Exception as e:
                                             print(f"Failed to send mod log embed: {e}")
-                                else:
-                                    await asyncio.to_thread(
-                                        database.add_verified_user,
-                                        user_id_str,
-                                        extracted_id,
-                                        student_name=s_name,
-                                        program_year=prog_year,
-                                        school_year_term=sy_term,
-                                        document_date=doc_date
+
+                                    duplicate_embed = discord.Embed(
+                                        title="Verification Rejected (Duplicate Document)",
+                                        description="❌ This Student Assessment Invoice (SAI) has already been registered to another Discord account. Duplicate submissions are strictly prohibited.\n\nIf you believe this is an error, please open a support ticket.",
+                                        color=discord.Color.red()
                                     )
-                                    
+                                    if status_msg:
+                                        await status_msg.edit(content="", embed=duplicate_embed, view=None)
+                                    elif channel:
+                                        await channel.send(embed=duplicate_embed)
+                                    continue
+                                else:
                                     guild_id = int(os.environ.get("GUILD_ID", 0))
                                     guild = (channel.guild if channel and hasattr(channel, "guild") else None) or self.get_guild(guild_id)
                                     role_assigned = False
@@ -289,6 +342,7 @@ class VerificationBot(commands.Bot):
                                         await status_msg.edit(content="✅ Analysis complete!", embed=success_embed, view=correction_view)
                                     elif channel:
                                         await channel.send(embed=success_embed, view=correction_view)
+                                    continue
 
                         # FAIL Logic (Warning or Lock)
                         await asyncio.to_thread(database.add_strike, user_id_str)
@@ -331,7 +385,7 @@ class VerificationBot(commands.Bot):
                                 pending_channel = self.get_channel(pending_channel_id)
 
                             if pending_channel:
-                                view = StaffButtonsView()
+                                view = StaffButtonsView(user_id=user_id, allow_edit=False)
                                 staff_embed = discord.Embed(
                                     title="Manual Verification Required",
                                     description="User has accumulated 2 strikes and is locked. Please review the attached document.",
@@ -400,7 +454,7 @@ class VerificationBot(commands.Bot):
                             pending_channel = self.get_channel(pending_channel_id)
 
                         if pending_channel and image_bytes:
-                            view = StaffButtonsView()
+                            view = StaffButtonsView(user_id=user_id, allow_edit=False)
                             staff_embed = discord.Embed(
                                 title="Manual Verification Required (AI Error / Timeout)",
                                 description="The AI verification pipeline encountered an error or timeout. User has been locked. Please review the attached document.",
@@ -422,6 +476,10 @@ class VerificationBot(commands.Bot):
                     if optimized_bytes is not None:
                         del optimized_bytes
                     gc.collect()
+                    try:
+                        ctypes.CDLL('libc.so.6').malloc_trim(0)
+                    except Exception:
+                        pass
                     self.verification_queue.task_done()
                     self.processing_users.discard(user_id)
 
@@ -521,6 +579,7 @@ class VerifyDropdown(discord.ui.Select):
                 ephemeral=True
             )
         except discord.Forbidden:
+            print(f"[GATEWAY] Warning: Cannot deliver DM to user {user.id}. DMs closed or blocked.")
             await interaction.followup.send(
                 "❌ Please enable Direct Messages from server members to apply.",
                 ephemeral=True
@@ -657,7 +716,7 @@ class RequestCorrectionView(discord.ui.View):
             staff_embed.add_field(name="Current Term", value=current_term, inline=True)
             staff_embed.add_field(name="Current Date", value=current_date, inline=True)
 
-            view = StaffButtonsView(user_id=user_id, current_data=record)
+            view = StaffButtonsView(user_id=user_id, allow_edit=True, current_data=record)
             try:
                 if image_bytes:
                     file_to_forward = discord.File(io.BytesIO(image_bytes), filename="sai_correction.jpg")
@@ -677,9 +736,10 @@ class RequestCorrectionView(discord.ui.View):
         )
 
 class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
-    def __init__(self, user_id: int, current_data: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, user_id: int, origin_view: discord.ui.View = None, current_data: Optional[Dict[str, Any]] = None) -> None:
         super().__init__()
         self.user_id = user_id
+        self.origin_view = origin_view
         current_data = current_data or {}
 
         self.student_name = discord.ui.TextInput(
@@ -733,11 +793,10 @@ class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
             new_embed.color = discord.Color.green()
             new_embed.add_field(name="Status", value=f"✅ Corrected by {interaction.user.mention}", inline=False)
             
-            view = interaction.message.view
-            if view:
-                for child in view.children:
+            if self.origin_view:
+                for child in self.origin_view.children:
                     child.disabled = True
-                await interaction.response.edit_message(embed=new_embed, view=view)
+                await interaction.response.edit_message(embed=new_embed, view=self.origin_view)
             else:
                 await interaction.response.edit_message(embed=new_embed)
         else:
@@ -753,6 +812,8 @@ class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
                     color=discord.Color.green()
                 )
                 await target_member.send(embed=dm_embed)
+            except discord.Forbidden:
+                print(f"[GATEWAY] Warning: Cannot deliver DM to user {self.user_id}. DMs closed or blocked.")
             except Exception as e:
                 print(f"Failed to DM corrected student {self.user_id}: {e}")
 
@@ -770,10 +831,13 @@ class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
             await send_audit_log(guild, log_embed)
 
 class StaffButtonsView(discord.ui.View):
-    def __init__(self, user_id: Optional[int] = None, current_data: Optional[Dict[str, Any]] = None) -> None:
+    def __init__(self, user_id: Optional[int] = None, allow_edit: bool = False, current_data: Optional[Dict[str, Any]] = None) -> None:
         super().__init__(timeout=None)
         self.user_id = user_id
         self.current_data = current_data
+        self.edit_details_btn = self.edit_details
+        if not allow_edit:
+            self.remove_item(self.edit_details_btn)
 
     @discord.ui.button(
         label="Accept",
@@ -871,6 +935,8 @@ class StaffButtonsView(discord.ui.View):
                     color=discord.Color.green()
                 )
                 await target_member.send(embed=success_embed)
+            except discord.Forbidden:
+                print(f"[GATEWAY] Warning: Cannot deliver DM to user {user_id}. DMs closed or blocked.")
             except Exception as e:
                 print(f"Failed to DM approved user {user_id}: {e}")
                 
@@ -935,6 +1001,8 @@ class StaffButtonsView(discord.ui.View):
                     color=discord.Color.red()
                 )
                 await target_member.send(embed=deny_embed)
+            except discord.Forbidden:
+                print(f"[GATEWAY] Warning: Cannot deliver DM to user {user_id}. DMs closed or blocked.")
             except Exception as e:
                 print(f"Failed to DM denied user {user_id}: {e}")
                 
@@ -993,7 +1061,7 @@ class StaffButtonsView(discord.ui.View):
         if not record:
             record = await asyncio.to_thread(database.get_student_by_discord_id, parsed_user_id)
 
-        modal = StudentEditModal(user_id=parsed_user_id, current_data=record)
+        modal = StudentEditModal(user_id=parsed_user_id, origin_view=self, current_data=record)
         await interaction.response.send_modal(modal)
 
 
@@ -1235,6 +1303,7 @@ async def on_app_command_error(interaction: discord.Interaction, error: app_comm
 
 @bot.event
 async def on_ready() -> None:
+    await asyncio.to_thread(database.checkpoint_db)
     database.reset_all_locks()
     print(f"[GATEWAY] Logged in as {bot.user} (ID: {bot.user.id if bot.user else 'Unknown'})", flush=True)
 
@@ -1259,6 +1328,19 @@ async def on_message(message: discord.Message) -> None:
 
     user_id = message.author.id
     user_id_str = str(user_id)
+
+    # Enforce attachment length check
+    if len(message.attachments) > 1:
+        try:
+            await message.author.send("⚠️ Please upload only 1 SAI document at a time.")
+        except discord.Forbidden:
+            print(f"[GATEWAY] Warning: Cannot deliver DM to user {user_id}. DMs closed or blocked.")
+        except Exception:
+            try:
+                await message.reply("⚠️ Please upload only 1 SAI document at a time.")
+            except Exception:
+                pass
+        return
     
     # In-flight DM Locking: check if user is already being processed or if locked in DB
     if user_id in bot.processing_users:
