@@ -258,3 +258,22 @@ If the verification system behaves unexpectedly, follow these escalation steps:
 1. **Bot Not Responding to Commands**: Check if the bot status indicator in Discord is online. If offline, notify the Server Administrator to inspect the host process.
 2. **Missing Permissions Error**: Ensure the bot's Discord role is positioned higher in the server's role hierarchy than the Verified Student role (`Alpha Member .ᐟ`).
 3. **Pterodactyl Console Escalation**: For technical maintenance or container issues, refer to the technical diagnostic procedures documented in [`QA_SMOKE_TEST.md`](QA_SMOKE_TEST.md).
+
+---
+
+## 5. WEEKLY SERVER MAINTENANCE & BACKUPS (CRITICAL)
+
+* **Host Renewal:** The bot is hosted on Bot-Hosting.net. Administrators MUST log into the panel weekly and click the **"Renew"** button. Failure to do so will result in the host deleting the container and permanently destroying the bot.
+* **Database Backups:** The SQLite database (`bot.db`) stores all verified student IDs and strike counts. Once a week, navigate to the panel's File Manager, right-click `bot.db`, and download it to a local computer. This guarantees zero data loss if the server crashes.
+
+---
+
+## 6. DISCORD ROLE HIERARCHY RULE
+
+The bot's role (`ALPHA AI Verifier`) MUST be physically dragged above the verified role (`Alpha Member .ᐟ`) in your Server Settings -> Roles list. If it is below it, the bot will fail to assign the role and throw a permission error.
+
+---
+
+## 7. HANDLING OCR TYPOS (THE CORRECTION MODAL)
+
+If the AI misreads a name (e.g., missing an `Ñ`), the student will click `[Report Info Mistake]` in their DMs. A ticket will appear in `#pending-submissions`. Moderators must click `[Edit Details]`, correct the typo in the popup modal, and click Submit to securely update the database.
