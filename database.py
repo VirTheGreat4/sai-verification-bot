@@ -183,7 +183,7 @@ def add_verified_user(
     program_year: Optional[str] = None,
     school_year_term: Optional[str] = None,
     document_date: Optional[str] = None
-) -> None:
+) -> bool:
     """
     Saves a successful verification using UPSERT to resolve primary key collisions.
     """
@@ -195,6 +195,11 @@ def add_verified_user(
     d_id_str = _normalize_discord_id(discord_id)
     with _connect() as conn:
         cursor = conn.cursor()
+        cursor.execute("SELECT discord_id FROM verified_students WHERE student_id_hash = ?", (hashed_id,))
+        row = cursor.fetchone()
+        if row and str(row[0]) != str(d_id_str):
+            return False  # Genuine duplicate: Another user owns this Student ID
+
         cursor.execute("""
             INSERT INTO verified_students (
                 discord_id, student_id_hash, student_name, program_year, school_year_term, document_date
@@ -216,6 +221,20 @@ def add_verified_user(
         except sqlite3.OperationalError:
             pass
         conn.commit()
+        return True
+
+def is_user_verified(discord_id: Union[int, str]) -> bool:
+    """
+    Returns True if a valid verified hash exists for the discord_id, False otherwise.
+    """
+    if discord_id is None:
+        return False
+    d_id_str = _normalize_discord_id(discord_id)
+    with _connect() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT student_id_hash FROM verified_students WHERE discord_id = ? AND student_id_hash IS NOT NULL;", (d_id_str,))
+        row = cursor.fetchone()
+        return row is not None and row[0] is not None
 
 def is_student_id_used(student_id: str) -> bool:
     """

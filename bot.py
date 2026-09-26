@@ -100,7 +100,8 @@ class VerificationBot(commands.Bot):
         # Register persistent views
         self.add_view(VerifyDropdownView())
         self.add_view(DMStartCancelView())
-        self.add_view(StaffButtonsView())
+        self.add_view(StaffTriageView())
+        self.add_view(StaffCorrectionView())
         self.add_view(RequestCorrectionView())
         
         # Sync slash commands
@@ -385,7 +386,7 @@ class VerificationBot(commands.Bot):
                                 pending_channel = self.get_channel(pending_channel_id)
 
                             if pending_channel:
-                                view = StaffButtonsView(user_id=user_id, allow_edit=False)
+                                view = StaffTriageView(user_id=user_id)
                                 staff_embed = discord.Embed(
                                     title="Manual Verification Required",
                                     description="User has accumulated 2 strikes and is locked. Please review the attached document.",
@@ -454,7 +455,7 @@ class VerificationBot(commands.Bot):
                             pending_channel = self.get_channel(pending_channel_id)
 
                         if pending_channel and image_bytes:
-                            view = StaffButtonsView(user_id=user_id, allow_edit=False)
+                            view = StaffTriageView(user_id=user_id)
                             staff_embed = discord.Embed(
                                 title="Manual Verification Required (AI Error / Timeout)",
                                 description="The AI verification pipeline encountered an error or timeout. User has been locked. Please review the attached document.",
@@ -547,6 +548,14 @@ class VerifyDropdown(discord.ui.Select):
         
         # Immediate defer to prevent 10062 Unknown interaction expiry
         await interaction.response.defer(ephemeral=True)
+
+        already_verified = await asyncio.to_thread(database.is_user_verified, user.id)
+        if already_verified:
+            await interaction.followup.send(
+                "✅ You are already verified as an Alpha Member!",
+                ephemeral=True
+            )
+            return
 
         # Clear session tracking dictionaries and sets so dropdown is never unresponsive
         if interaction.client and hasattr(interaction.client, "processing_users"):
@@ -716,7 +725,7 @@ class RequestCorrectionView(discord.ui.View):
             staff_embed.add_field(name="Current Term", value=current_term, inline=True)
             staff_embed.add_field(name="Current Date", value=current_date, inline=True)
 
-            view = StaffButtonsView(user_id=user_id, allow_edit=True, current_data=record)
+            view = StaffCorrectionView(user_id=user_id, current_data=record)
             try:
                 if image_bytes:
                     file_to_forward = discord.File(io.BytesIO(image_bytes), filename="sai_correction.jpg")
@@ -830,14 +839,10 @@ class StudentEditModal(discord.ui.Modal, title="Edit Student Information"):
             log_embed.add_field(name="Date", value=date, inline=True)
             await send_audit_log(guild, log_embed)
 
-class StaffButtonsView(discord.ui.View):
-    def __init__(self, user_id: Optional[int] = None, allow_edit: bool = False, current_data: Optional[Dict[str, Any]] = None) -> None:
+class StaffTriageView(discord.ui.View):
+    def __init__(self, user_id: Optional[int] = None) -> None:
         super().__init__(timeout=None)
         self.user_id = user_id
-        self.current_data = current_data
-        self.edit_details_btn = self.edit_details
-        if not allow_edit:
-            self.remove_item(self.edit_details_btn)
 
     @discord.ui.button(
         label="Accept",
@@ -1015,6 +1020,12 @@ class StaffButtonsView(discord.ui.View):
         new_embed.add_field(name="Status", value=f"❌ Denied by {member.mention}", inline=False)
         await interaction.response.edit_message(embed=new_embed, view=self)
 
+class StaffCorrectionView(discord.ui.View):
+    def __init__(self, user_id: Optional[int] = None, current_data: Optional[Dict[str, Any]] = None) -> None:
+        super().__init__(timeout=None)
+        self.user_id = user_id
+        self.current_data = current_data
+
     @discord.ui.button(
         label="Edit Details",
         style=discord.ButtonStyle.primary,
@@ -1063,6 +1074,43 @@ class StaffButtonsView(discord.ui.View):
 
         modal = StudentEditModal(user_id=parsed_user_id, origin_view=self, current_data=record)
         await interaction.response.send_modal(modal)
+
+    @discord.ui.button(
+        label="Dismiss",
+        style=discord.ButtonStyle.secondary,
+        custom_id="persistent:staff_dismiss_btn"
+    )
+    async def dismiss(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        guild = interaction.guild
+        if not guild:
+            await interaction.response.send_message("❌ Error: Must be used in a server.", ephemeral=True)
+            return
+
+        try:
+            member = await guild.fetch_member(interaction.user.id)
+        except Exception:
+            await interaction.response.send_message("❌ Error: Member not found.", ephemeral=True)
+            return
+
+        support_role_id = int(os.environ.get("SUPPORT_ROLE_ID", 0))
+        is_authorized = any(role.id == support_role_id for role in member.roles) or member.guild_permissions.administrator
+        if not is_authorized:
+            await interaction.response.send_message("❌ No permission.", ephemeral=True)
+            return
+
+        if not interaction.message or not interaction.message.embeds:
+            await interaction.response.send_message("❌ Error: Embed message not found.", ephemeral=True)
+            return
+
+        embed = interaction.message.embeds[0]
+        for child in self.children:
+            child.disabled = True
+
+        new_embed = discord.Embed.from_dict(embed.to_dict())
+        new_embed.color = discord.Color.light_gray()
+        new_embed.add_field(name="Status", value=f"ℹ️ Dismissed by {member.mention} (No changes made)", inline=False)
+        await interaction.response.edit_message(embed=new_embed, view=self)
+        await interaction.followup.send("✅ Correction request dismissed.", ephemeral=True)
 
 
 bot = VerificationBot()
@@ -1328,6 +1376,17 @@ async def on_message(message: discord.Message) -> None:
 
     user_id = message.author.id
     user_id_str = str(user_id)
+
+    already_verified = await asyncio.to_thread(database.is_user_verified, message.author.id)
+    if already_verified:
+        try:
+            await message.author.send("✅ You are already verified as an Alpha Member! If you need to correct your student information, use the 'Report Info Mistake' button or contact staff.")
+        except Exception:
+            try:
+                await message.reply("✅ You are already verified as an Alpha Member! If you need to correct your student information, use the 'Report Info Mistake' button or contact staff.")
+            except Exception:
+                pass
+        return
 
     # Enforce attachment length check
     if len(message.attachments) > 1:

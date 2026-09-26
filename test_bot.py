@@ -41,7 +41,7 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
         await test_bot.setup_hook()
         
         mock_init_db.assert_called_once()
-        self.assertEqual(test_bot.add_view.call_count, 4)
+        self.assertEqual(test_bot.add_view.call_count, 5)
         mock_sync.assert_called_once()
 
     async def test_verify_dropdown_forbidden(self) -> None:
@@ -349,15 +349,15 @@ class TestBot(unittest.IsolatedAsyncioTestCase):
 
     async def test_duplicate_student_id_rejection(self) -> None:
         database.add_verified_user("111111", "DUPLICATE_ID")
-        with self.assertRaises(sqlite3.IntegrityError):
-            database.add_verified_user("222222", "DUPLICATE_ID")
+        res = database.add_verified_user("222222", "DUPLICATE_ID")
+        self.assertFalse(res)
 
-    def test_staff_buttons_view_allow_edit(self) -> None:
-        view_default = bot.StaffButtonsView(allow_edit=False)
-        self.assertEqual(len(view_default.children), 2)
+    def test_staff_views(self) -> None:
+        triage_view = bot.StaffTriageView()
+        self.assertEqual(len(triage_view.children), 2)
 
-        view_editable = bot.StaffButtonsView(allow_edit=True)
-        self.assertEqual(len(view_editable.children), 3)
+        correction_view = bot.StaffCorrectionView()
+        self.assertEqual(len(correction_view.children), 2)
 
 if __name__ == "__main__":
     unittest.main()
